@@ -49,6 +49,7 @@
   "scripts": {
     "up": "node scripts/run.js",
     "build": "node scripts/build.js",
+    "prepare": "tsc",
     "up:build": "node scripts/build-and-run.js",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",

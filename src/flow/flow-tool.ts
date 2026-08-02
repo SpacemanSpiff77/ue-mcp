@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { createHash } from "node:crypto";
 import { FlowRunner } from "@db-lyon/flowkit";
 import type {
   TaskRegistry,
@@ -26,6 +27,57 @@ import {
   trimStepResult,
   trimError,
 } from "./events.js";
+
+export const HTTP_STEP_RESULT_MAX_BYTES = 4 * 1024 * 1024;
+export const HTTP_TOTAL_RESULT_MAX_BYTES = 8 * 1024 * 1024;
+export const HTTP_ERROR_MAX_CHARS = 2 * 1024;
+
+const HTTP_FLOW_RESULT_OPTIONS = Symbol("ue-mcp.http-flow-result-options");
+const REDACTED = "[REDACTED]";
+const SENSITIVE_KEYS = new Set([
+  "authorization",
+  "token",
+  "access_token",
+  "refresh_token",
+  "api_key",
+  "apikey",
+  "password",
+  "secret",
+  "cookie",
+  "set-cookie",
+  "ue_mcp_http_token",
+]);
+const INTERNAL_KEYS = new Set([
+  "bridge",
+  "context",
+  "flowcontext",
+  "project",
+  "rollback",
+]);
+
+export interface FlowResultFormatOptions {
+  includeStepData?: boolean;
+  maxStepBytes?: number;
+  maxTotalBytes?: number;
+  maxErrorChars?: number;
+  activeToken?: string;
+}
+
+type HttpFlowParams = Record<string, unknown> & {
+  [HTTP_FLOW_RESULT_OPTIONS]?: FlowResultFormatOptions;
+};
+
+export function withHttpFlowResultOptions(
+  params: Record<string, unknown>,
+  activeToken: string,
+  options: Omit<FlowResultFormatOptions, "includeStepData" | "activeToken"> = {},
+): Record<string, unknown> {
+  Object.defineProperty(params, HTTP_FLOW_RESULT_OPTIONS, {
+    value: { ...options, includeStepData: true, activeToken },
+    enumerable: false,
+  });
+  return params;
+}
 
 /**
  * Name a failed rollback by the bridge method it tried to call. Every record
@@ -116,7 +168,13 @@ async function runFlow(
   const flowName = params.flowName as string;
   if (!flowName) throw new Error("flowName is required");
   const skip = (params.skip as string[] | undefined) ?? [];
-  const flowParams = params.params as Record<string, unknown> | undefined;
+  const httpOptions = (params as HttpFlowParams)[HTTP_FLOW_RESULT_OPTIONS];
+  const suppliedFlowParams = params.params as Record<string, unknown> | undefined;
+  const flowParams = httpOptions?.includeStepData
+    && suppliedFlowParams?.request !== undefined
+    && suppliedFlowParams.input === undefined
+      ? { ...suppliedFlowParams, input: { request: suppliedFlowParams.request } }
+      : suppliedFlowParams;
   const rollback_on_failure = params.rollback_on_failure as boolean | undefined;
 
   // One runId per top-level call. Every per-step / per-run event we
@@ -126,7 +184,10 @@ async function runFlow(
   const runner = makeRunner(registry, config, ctx, runId, flowName);
   const result = await runner.run({ flowName, skip, params: flowParams, rollback_on_failure });
 
-  const formatted = formatFlowResult(result);
+  const formatted = formatFlowResult(
+    result,
+    httpOptions,
+  );
   return { ...formatted, runId };
 }
 
@@ -255,7 +316,10 @@ function makeRunner(
   });
 }
 
-function formatFlowResult(result: FlowRunResult): Record<string, unknown> {
+export function formatFlowResult(
+  result: FlowRunResult,
+  options: FlowResultFormatOptions = {},
+): Record<string, unknown> {
   const lines: string[] = [];
   const icon = result.success ? "✓" : "✗";
   lines.push(`${icon} Flow ${result.success ? "completed" : "failed"} in ${formatDuration(result.duration)}`);
@@ -316,7 +380,7 @@ function formatFlowResult(result: FlowRunResult): Record<string, unknown> {
     }
   }
 
-  return {
+  const formatted: Record<string, unknown> = {
     summary: lines.join("\n"),
     success: result.success,
     duration: result.duration,
@@ -325,6 +389,118 @@ function formatFlowResult(result: FlowRunResult): Record<string, unknown> {
     rollback: result.rollback,
     hookErrors: result.hookErrors,
   };
+  if (options.includeStepData) {
+    formatted.steps = formatHttpSteps(result.steps, options);
+  }
+  return formatted;
+}
+
+function formatHttpSteps(
+  steps: FlowStepResult[],
+  options: FlowResultFormatOptions,
+): Array<Record<string, unknown>> {
+  const maxStepBytes = options.maxStepBytes ?? HTTP_STEP_RESULT_MAX_BYTES;
+  const maxTotalBytes = options.maxTotalBytes ?? HTTP_TOTAL_RESULT_MAX_BYTES;
+  const maxErrorChars = options.maxErrorChars ?? HTTP_ERROR_MAX_CHARS;
+  let totalBytes = 0;
+
+  return steps.map((step) => {
+    const formatted: Record<string, unknown> = {
+      stepNumber: step.stepNumber,
+      name: step.name,
+      type: step.type,
+      duration: step.duration,
+      attempts: step.attempts,
+      skipped: step.skipped,
+    };
+    if (!step.result) return formatted;
+
+    const result: Record<string, unknown> = { success: step.result.success };
+    if (step.result.error) {
+      result.error = {
+        name: redactString(step.result.error.name ?? "Error", options.activeToken).slice(0, maxErrorChars),
+        message: redactString(step.result.error.message, options.activeToken).slice(0, maxErrorChars),
+      };
+    }
+    if (step.result.data !== undefined) {
+      const sanitized = sanitizeJsonValue(step.result.data, options.activeToken);
+      const serialized = JSON.stringify(sanitized);
+      const originalBytes = Buffer.byteLength(serialized, "utf8");
+      const digest = createHash("sha256").update(serialized).digest("hex");
+      if (originalBytes > maxStepBytes) {
+        Object.assign(result, omission("result_too_large", originalBytes, maxStepBytes, digest));
+      } else if (totalBytes + originalBytes > maxTotalBytes) {
+        Object.assign(result, omission("total_result_limit", originalBytes, maxTotalBytes, digest));
+      } else {
+        result.data = sanitized;
+        totalBytes += originalBytes;
+      }
+    }
+    formatted.result = result;
+    return formatted;
+  });
+}
+
+function omission(
+  reason: "result_too_large" | "total_result_limit",
+  originalBytes: number,
+  limitBytes: number,
+  sha256: string,
+): Record<string, unknown> {
+  return { dataOmitted: true, reason, originalBytes, limitBytes, sha256 };
+}
+
+function redactString(value: string, activeToken?: string): string {
+  if (!activeToken) return value;
+  return value.split(activeToken).join(REDACTED);
+}
+
+function sanitizeJsonValue(
+  value: unknown,
+  activeToken?: string,
+  seen = new WeakSet<object>(),
+): unknown {
+  if (value === null || typeof value === "boolean" || typeof value === "number") {
+    return Number.isFinite(value as number) || typeof value !== "number" ? value : String(value);
+  }
+  if (typeof value === "string") return redactString(value, activeToken);
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "undefined" || typeof value === "function" || typeof value === "symbol") {
+    return "[UNSERIALIZABLE]";
+  }
+  if (value instanceof Date) return value.toISOString();
+  if (value instanceof Error) {
+    return {
+      name: redactString(value.name, activeToken),
+      message: redactString(value.message, activeToken).slice(0, HTTP_ERROR_MAX_CHARS),
+    };
+  }
+  if (typeof value !== "object") return String(value);
+  if (seen.has(value)) return "[CIRCULAR]";
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    return value.map((entry) => sanitizeJsonValue(entry, activeToken, seen));
+  }
+
+  const source = value as Record<string, unknown>;
+  const output: Record<string, unknown> = {};
+  for (const key of Object.keys(source).sort()) {
+    if (INTERNAL_KEYS.has(key.toLowerCase())) {
+      output[key] = "[OMITTED_INTERNAL]";
+      continue;
+    }
+    if (SENSITIVE_KEYS.has(key.toLowerCase())) {
+      output[key] = REDACTED;
+      continue;
+    }
+    try {
+      output[key] = sanitizeJsonValue(source[key], activeToken, seen);
+    } catch {
+      output[key] = "[UNSERIALIZABLE]";
+    }
+  }
+  return output;
 }
 
 function formatDuration(ms: number): string {

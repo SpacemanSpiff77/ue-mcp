@@ -1,6 +1,9 @@
 import * as http from "node:http";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import type { createFlowTool } from "./flow-tool.js";
+import {
+  withHttpFlowResultOptions,
+  type createFlowTool,
+} from "./flow-tool.js";
 import type { ToolContext } from "../types.js";
 import { info, warn, error as logError } from "../log.js";
 import { subscribeFlowEvents, type FlowEvent } from "./events.js";
@@ -117,7 +120,10 @@ export function startFlowHttpServer(
           if (b.skip !== undefined) params.skip = b.skip;
           if (b.rollback_on_failure !== undefined) params.rollback_on_failure = b.rollback_on_failure;
         }
-        const result = await flowTool.handler(ctx, params);
+        const result = await flowTool.handler(
+          ctx,
+          withHttpFlowResultOptions(params, token),
+        );
         return send(200, result);
       }
 
