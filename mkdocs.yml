@@ -59,6 +59,7 @@ nav:
   - Getting Started: getting-started.md
   - Architecture: architecture.md
   - Tool Reference: tool-reference.md
+  - Full Blueprint Topology: blueprint-topology.md
   - Native Tools: native-tools.md
   - Handler Conventions: handler-conventions.md
   - Flows: flows.md

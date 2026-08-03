@@ -34,10 +34,15 @@ describe("blueprint.read_function_topology", () => {
       `${root}/plugin/UE_MCP_Bridge/Source/UE_MCP_Bridge/Private/Handlers/BlueprintHandlers.cpp`,
       "utf8",
     );
-    const provider = await readFile(
+    const selectedProvider = await readFile(
       `${root}/plugin/UE_MCP_Bridge/Source/UE_MCP_Bridge/Private/Handlers/BlueprintHandlers_Topology.cpp`,
       "utf8",
     );
+    const sharedSerializer = await readFile(
+      `${root}/plugin/UE_MCP_Bridge/Source/UE_MCP_Bridge/Private/Handlers/BlueprintTopologySerializer.cpp`,
+      "utf8",
+    );
+    const provider = `${selectedProvider}\n${sharedSerializer}`;
 
     expect(registration).toContain('TEXT("read_blueprint_function_topology")');
     expect(provider).toContain('TEXT("spacehead.selected-function-topology@1.0")');

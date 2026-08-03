@@ -39,7 +39,7 @@ export function buildFlowRegistry(tools: ToolDef[]): TaskRegistry {
       } else if (spec.bridge) {
         registry.register(
           taskName,
-          bridgeTaskClass(taskName, spec.bridge, spec.mapParams),
+          bridgeTaskClass(taskName, spec.bridge, spec.mapParams, spec.timeoutMs),
         );
       }
     }
