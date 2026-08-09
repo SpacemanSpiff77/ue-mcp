@@ -88,6 +88,7 @@ void FBlueprintHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandlerWithTimeout(TEXT("read_blueprint_topology"), &ReadBlueprintTopology, ReadBlueprintGraphTimeoutSeconds);
 	Registry.RegisterHandler(TEXT("read_blueprint_topology_chunk"), &ReadBlueprintTopologyChunk);
 	Registry.RegisterHandler(TEXT("release_blueprint_topology_capture"), &ReleaseBlueprintTopologyCapture);
+	Registry.RegisterHandler(TEXT("apply_build_spec"), &ApplyBuildSpec);
 	Registry.RegisterHandler(TEXT("add_event_dispatcher"), &AddEventDispatcher);
 	Registry.RegisterHandler(TEXT("rename_function"), &RenameFunction);
 	Registry.RegisterHandler(TEXT("delete_function"), &DeleteFunction);
