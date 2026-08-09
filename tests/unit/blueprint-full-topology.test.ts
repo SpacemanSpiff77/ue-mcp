@@ -233,6 +233,23 @@ describe("blueprint.read_blueprint_topology", () => {
       .toBe(createHash("sha256").update(frozen).digest("hex"));
   });
 
+  it("uses the supported PlatformCrypto SHA-256 implementation and declares its dependencies", async () => {
+    const [provider, buildRules, pluginDescriptor] = await Promise.all([
+      readFile(fullProviderPath, "utf8"),
+      readFile(`${root}/plugin/UE_MCP_Bridge/Source/UE_MCP_Bridge/UE_MCP_Bridge.Build.cs`, "utf8"),
+      readFile(`${root}/plugin/UE_MCP_Bridge/UE_MCP_Bridge.uplugin`, "utf8"),
+    ]);
+
+    expect(provider).not.toContain("FPlatformMisc::GetSHA256Signature");
+    expect(provider).toContain('#include "IPlatformCrypto.h"');
+    expect(provider).toContain("IPlatformCrypto::Get().CreateContext()");
+    expect(provider).toContain("EncryptionContext->CalcSHA256(Bytes, HashBytes)");
+    expect(provider).toContain("BytesToHex(HashBytes.GetData(), HashBytes.Num()).ToLower()");
+    expect(buildRules).toContain('"PlatformCrypto"');
+    expect(buildRules).toContain('"PlatformCryptoContext"');
+    expect(JSON.parse(pluginDescriptor).Plugins).toContainEqual({ Name: "PlatformCrypto", Enabled: true });
+  });
+
   it("enforces exact completeness and a read-only dirty-state mutation guard", async () => {
     const provider = await readFile(fullProviderPath, "utf8");
     expect(provider).toContain("bGraphInventoryComplete");

@@ -24,6 +24,10 @@
 	],
 	"Plugins": [
 		{
+			"Name": "PlatformCrypto",
+			"Enabled": true
+		},
+		{
 			"Name": "PythonScriptPlugin",
 			"Enabled": true
 		},

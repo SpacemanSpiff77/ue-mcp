@@ -11,7 +11,7 @@
 #include "EdGraph/EdGraphSchema.h"
 #include "EdGraphSchema_K2.h"
 #include "Engine/Blueprint.h"
-#include "HAL/PlatformMisc.h"
+#include "IPlatformCrypto.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Misc/Base64.h"
 #include "Misc/DateTime.h"
@@ -205,12 +205,19 @@ namespace
 
 	FString Sha256Bytes(const TArray<uint8>& Bytes)
 	{
-		FSHA256Signature Signature{};
-		if (!FPlatformMisc::GetSHA256Signature(Bytes.GetData(), static_cast<uint32>(Bytes.Num()), Signature))
+		TUniquePtr<FEncryptionContext> EncryptionContext = IPlatformCrypto::Get().CreateContext();
+		if (!EncryptionContext.IsValid())
 		{
 			return FString();
 		}
-		return Signature.ToString().ToLower();
+
+		TArray<uint8> HashBytes;
+		if (!EncryptionContext->CalcSHA256(Bytes, HashBytes))
+		{
+			return FString();
+		}
+
+		return BytesToHex(HashBytes.GetData(), HashBytes.Num()).ToLower();
 	}
 
 	void CleanupExpiredFullTopologyCaptures()

@@ -77,6 +77,8 @@ public class UE_MCP_Bridge : ModuleRules
 				"PCGEditor",
 				"PoseSearch",
 				"PoseSearchEditor",
+				"PlatformCrypto",
+				"PlatformCryptoContext",
 				"PropertyBindingUtils",
 				"PropertyEditor",
 				"PythonScriptPlugin",
