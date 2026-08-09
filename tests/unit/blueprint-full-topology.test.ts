@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { blueprintTool } from "../../src/tools/blueprint.js";
 import { ALL_TOOLS } from "../../src/tools.js";
@@ -44,6 +45,26 @@ describe("blueprint.read_blueprint_topology", () => {
       maxTotalConnections: 65536,
       maxSerializedBytes: 3670016,
     }, 180_000);
+  });
+
+  it("maps immutable chunk fetch and release to their native handlers", async () => {
+    const call = vi.fn(async () => ({ success: true }));
+    const ctx = { bridge: { call }, project: {} } as unknown as ToolContext;
+    await blueprintTool.handler(ctx, {
+      action: "read_blueprint_topology_chunk",
+      captureHandle: "a".repeat(64),
+      chunkIndex: 2,
+    });
+    await blueprintTool.handler(ctx, {
+      action: "release_blueprint_topology_capture",
+      captureHandle: "a".repeat(64),
+    });
+    expect(call).toHaveBeenNthCalledWith(1, "read_blueprint_topology_chunk", {
+      captureHandle: "a".repeat(64), chunkIndex: 2,
+    }, undefined);
+    expect(call).toHaveBeenNthCalledWith(2, "release_blueprint_topology_capture", {
+      captureHandle: "a".repeat(64),
+    }, undefined);
   });
 
   it("resolves from runtime Flow defaults and registry without filesystem fallback", async () => {
@@ -162,7 +183,7 @@ describe("blueprint.read_blueprint_topology", () => {
     expect(provider).not.toMatch(/Set(?:String|Number)Field\(TEXT\("(timestamp|observedAt|readAt)"\)/);
   });
 
-  it("preflights per-graph, whole-Blueprint, authored-count, and payload bounds with atomic omission", async () => {
+  it("keeps non-byte bounds atomic and converts only the inline byte boundary to multipart", async () => {
     const provider = await readFile(fullProviderPath, "utf8");
     for (const bound of [
       "MaxAuthoredGraphs", "MaxNodesPerGraph", "MaxPinsPerGraph",
@@ -172,9 +193,44 @@ describe("blueprint.read_blueprint_topology", () => {
       expect(provider).toContain(bound);
     }
     expect(provider).toContain('SetArrayField(TEXT("graphs"), {})');
-    expect(provider).toContain('SetBoolField(TEXT("truncated"), true)');
-    expect(provider).toContain('SetBoolField(TEXT("dataOmitted"), true)');
-    expect(provider).toContain('SetBoolField(TEXT("allOrNothing"), true)');
+    expect(provider).toContain('SetBoolField(TEXT("truncated"), bNonByteBoundViolation)');
+    expect(provider).toContain('SetBoolField(TEXT("dataOmitted"), bNonByteBoundViolation)');
+    expect(provider).toContain('Omission->SetBoolField(TEXT("allOrNothing"), true)');
+    expect(provider).toContain('TEXT("spacehead.full-blueprint-topology-multipart@1.0")');
+    expect(provider).toContain('TEXT("spacehead.full-blueprint-topology-chunk@1.0")');
+    expect(provider).toContain("FrozenBytes.Num() <= Limits.MaxSerializedBytes");
+    expect(provider).not.toContain("serialized provider payload %d bytes exceeds %d");
+  });
+
+  it("freezes one authoritative capture with bounded lifecycle and no Unreal access during chunk reads", async () => {
+    const provider = await readFile(fullProviderPath, "utf8");
+    for (const evidence of [
+      "MultipartRawChunkBytes", "MultipartCaptureTtlSeconds", "MultipartMaxActiveCaptures",
+      "MultipartMaxRetainedBytes", "CleanupExpiredFullTopologyCaptures", "NewCaptureHandle",
+      "SnapshotHash", "chunkHash", "offset", "rawByteCount", "expiresAtUtc",
+    ]) expect(provider).toContain(evidence);
+    expect(provider).toContain('SetBoolField(TEXT("unrealAccessed"), false)');
+    expect(provider).toContain("FullTopologyCaptures.Find(CaptureHandle)");
+    expect(provider).toContain("FullTopologyCaptures.Remove(CaptureHandle)");
+    expect(provider).toContain("chunk index is out of range");
+    expect(provider).toContain("not found, expired, or released");
+
+    const chunkSize = 2 * 1024 * 1024;
+    const frozen = Buffer.alloc(5_231_702, 0x5a);
+    const chunks = Array.from({ length: Math.ceil(frozen.length / chunkSize) }, (_, index) =>
+      frozen.subarray(index * chunkSize, Math.min((index + 1) * chunkSize, frozen.length)));
+    expect(chunks).toHaveLength(3);
+    const envelopes = chunks.map((chunk, chunkIndex) => ({
+      contractVersion: "spacehead.full-blueprint-topology-chunk@1.0",
+      captureHandle: "a".repeat(64), chunkIndex, offset: chunkIndex * chunkSize,
+      rawByteCount: chunk.length, encoding: "base64", data: chunk.toString("base64"),
+      chunkHash: createHash("sha256").update(chunk).digest("hex"),
+    }));
+    expect(envelopes.every(envelope => Buffer.byteLength(JSON.stringify(envelope)) < 4 * 1024 * 1024)).toBe(true);
+    const rebuilt = Buffer.concat(envelopes.map(envelope => Buffer.from(envelope.data, "base64")));
+    expect(rebuilt.equals(frozen)).toBe(true);
+    expect(createHash("sha256").update(rebuilt).digest("hex"))
+      .toBe(createHash("sha256").update(frozen).digest("hex"));
   });
 
   it("enforces exact completeness and a read-only dirty-state mutation guard", async () => {

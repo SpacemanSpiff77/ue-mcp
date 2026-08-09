@@ -11,7 +11,10 @@
 #include "EdGraph/EdGraphSchema.h"
 #include "EdGraphSchema_K2.h"
 #include "Engine/Blueprint.h"
+#include "HAL/PlatformMisc.h"
 #include "Kismet2/BlueprintEditorUtils.h"
+#include "Misc/Base64.h"
+#include "Misc/DateTime.h"
 #include "Misc/SecureHash.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
@@ -37,6 +40,26 @@ namespace
 	constexpr int32 HardMaxTotalPins = 131072;
 	constexpr int32 HardMaxTotalConnections = 262144;
 	constexpr int32 HardMaxSerializedBytes = 8388608;
+	constexpr int32 MultipartRawChunkBytes = 2 * 1024 * 1024;
+	constexpr int32 MultipartCaptureTtlSeconds = 300;
+	constexpr int32 MultipartMaxActiveCaptures = 4;
+	constexpr int64 MultipartMaxRetainedBytes = 64ll * 1024ll * 1024ll;
+
+	struct FFullTopologyCapture
+	{
+		FString Handle;
+		FString AssetPath;
+		FString ObjectPath;
+		FString InventoryHash;
+		FString InventoryToken;
+		FString SnapshotHash;
+		FDateTime CreatedAtUtc;
+		FDateTime ExpiresAtUtc;
+		TArray<uint8> FrozenBytes;
+	};
+
+	TMap<FString, FFullTopologyCapture> FullTopologyCaptures;
+	int64 FullTopologyRetainedBytes = 0;
 
 	struct FFullTopologyLimits
 	{
@@ -165,6 +188,80 @@ namespace
 		}
 		FTCHARToUTF8 Utf8(*Text);
 		return Utf8.Length();
+	}
+
+	bool SerializeUtf8(const TSharedPtr<FJsonObject>& Json, TArray<uint8>& OutBytes)
+	{
+		OutBytes.Reset();
+		if (!Json.IsValid()) return false;
+		FString Text;
+		const TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+			TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Text);
+		if (!FJsonSerializer::Serialize(Json.ToSharedRef(), Writer)) return false;
+		FTCHARToUTF8 Utf8(*Text);
+		OutBytes.Append(reinterpret_cast<const uint8*>(Utf8.Get()), Utf8.Length());
+		return true;
+	}
+
+	FString Sha256Bytes(const TArray<uint8>& Bytes)
+	{
+		FSHA256Signature Signature{};
+		if (!FPlatformMisc::GetSHA256Signature(Bytes.GetData(), static_cast<uint32>(Bytes.Num()), Signature))
+		{
+			return FString();
+		}
+		return Signature.ToString().ToLower();
+	}
+
+	void CleanupExpiredFullTopologyCaptures()
+	{
+		const FDateTime Now = FDateTime::UtcNow();
+		TArray<FString> ExpiredHandles;
+		for (const TPair<FString, FFullTopologyCapture>& Pair : FullTopologyCaptures)
+		{
+			if (Pair.Value.ExpiresAtUtc <= Now) ExpiredHandles.Add(Pair.Key);
+		}
+		for (const FString& Handle : ExpiredHandles)
+		{
+			if (const FFullTopologyCapture* Capture = FullTopologyCaptures.Find(Handle))
+			{
+				FullTopologyRetainedBytes -= Capture->FrozenBytes.Num();
+			}
+			FullTopologyCaptures.Remove(Handle);
+		}
+	}
+
+	FString NewCaptureHandle()
+	{
+		return FGuid::NewGuid().ToString(EGuidFormats::Digits)
+			+ FGuid::NewGuid().ToString(EGuidFormats::Digits);
+	}
+
+	TSharedPtr<FJsonObject> CaptureManifest(const FFullTopologyCapture& Capture)
+	{
+		TSharedPtr<FJsonObject> Manifest = MCPSuccess();
+		Manifest->SetStringField(TEXT("contractVersion"), TEXT("spacehead.full-blueprint-topology-multipart@1.0"));
+		Manifest->SetStringField(TEXT("logicalContractVersion"), TEXT("spacehead.full-blueprint-topology@1.0"));
+		Manifest->SetStringField(TEXT("delivery"), TEXT("multipart"));
+		Manifest->SetStringField(TEXT("status"), TEXT("capture-ready"));
+		Manifest->SetStringField(TEXT("captureHandle"), Capture.Handle);
+		Manifest->SetStringField(TEXT("assetPath"), Capture.AssetPath);
+		Manifest->SetStringField(TEXT("objectPath"), Capture.ObjectPath);
+		Manifest->SetNumberField(TEXT("totalBytes"), Capture.FrozenBytes.Num());
+		Manifest->SetNumberField(TEXT("chunkCount"),
+			FMath::DivideAndRoundUp(Capture.FrozenBytes.Num(), MultipartRawChunkBytes));
+		Manifest->SetNumberField(TEXT("rawChunkSizeBytes"), MultipartRawChunkBytes);
+		Manifest->SetStringField(TEXT("encoding"), TEXT("base64"));
+		Manifest->SetStringField(TEXT("snapshotHash"), Capture.SnapshotHash);
+		Manifest->SetStringField(TEXT("snapshotHashAlgorithm"), TEXT("sha256"));
+		Manifest->SetStringField(TEXT("inventoryHash"), Capture.InventoryHash);
+		Manifest->SetStringField(TEXT("inventoryToken"), Capture.InventoryToken);
+		Manifest->SetStringField(TEXT("createdAtUtc"), Capture.CreatedAtUtc.ToIso8601());
+		Manifest->SetStringField(TEXT("expiresAtUtc"), Capture.ExpiresAtUtc.ToIso8601());
+		Manifest->SetNumberField(TEXT("ttlSeconds"), MultipartCaptureTtlSeconds);
+		Manifest->SetBoolField(TEXT("unrealAccessedForChunks"), false);
+		Manifest->SetBoolField(TEXT("mutationOperationsPerformed"), false);
+		return Manifest;
 	}
 
 	void CountGraph(FGraphInventoryRecord& Record)
@@ -738,48 +835,30 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ReadBlueprintTopology(const TSharedPt
 	Result->SetNumberField(TEXT("serializedNodeCount"), SerializedNodeCount);
 	Result->SetNumberField(TEXT("serializedPinCount"), SerializedPinCount);
 	Result->SetNumberField(TEXT("serializedConnectionCount"), SerializedConnectionCount);
-	Result->SetBoolField(TEXT("truncated"), false);
-	Result->SetBoolField(TEXT("dataOmitted"), false);
-
-	int32 PayloadBytes = 0;
-	if (BoundViolations.IsEmpty())
-	{
-		PayloadBytes = SerializedByteCount(Result);
-		if (PayloadBytes > Limits.MaxSerializedBytes)
-		{
-			BoundViolations.Add(FString::Printf(TEXT("serialized provider payload %d bytes exceeds %d"),
-				PayloadBytes, Limits.MaxSerializedBytes));
-		}
-	}
-	Result->SetNumberField(TEXT("serializedPayloadBytes"), PayloadBytes);
-
-	const bool bDataOmitted = !BoundViolations.IsEmpty();
-	if (bDataOmitted)
-	{
-		Result->SetArrayField(TEXT("graphs"), {});
-		Result->SetBoolField(TEXT("truncated"), true);
-		Result->SetBoolField(TEXT("dataOmitted"), true);
-		Result->SetStringField(TEXT("status"), TEXT("omitted"));
-	}
+	const bool bNonByteBoundViolation = !BoundViolations.IsEmpty();
+	if (bNonByteBoundViolation) Result->SetArrayField(TEXT("graphs"), {});
+	Result->SetBoolField(TEXT("truncated"), bNonByteBoundViolation);
+	Result->SetBoolField(TEXT("dataOmitted"), bNonByteBoundViolation);
+	Result->SetNumberField(TEXT("serializedPayloadBytes"), 0);
 
 	TSharedPtr<FJsonObject> Omission = MakeShared<FJsonObject>();
-	Omission->SetBoolField(TEXT("omitted"), bDataOmitted);
+	Omission->SetBoolField(TEXT("omitted"), bNonByteBoundViolation);
 	Omission->SetBoolField(TEXT("allOrNothing"), true);
-	Omission->SetStringField(TEXT("reason"), bDataOmitted
-		? TEXT("one or more full-Blueprint topology bounds were exceeded; no graph topology was returned")
+	Omission->SetStringField(TEXT("reason"), bNonByteBoundViolation
+		? TEXT("one or more non-byte full-Blueprint topology bounds were exceeded; no graph topology was returned")
 		: FString());
 	Omission->SetArrayField(TEXT("violations"), StringValues(BoundViolations));
-	Omission->SetNumberField(TEXT("omittedGraphCount"), bDataOmitted ? CapturedGraphCount : 0);
-	Omission->SetNumberField(TEXT("omittedNodeCount"), bDataOmitted ? TotalNodeCount : 0);
-	Omission->SetNumberField(TEXT("omittedPinCount"), bDataOmitted ? TotalPinCount : 0);
-	Omission->SetNumberField(TEXT("omittedConnectionCount"), bDataOmitted ? TotalConnectionCount : 0);
+	Omission->SetNumberField(TEXT("omittedGraphCount"), bNonByteBoundViolation ? CapturedGraphCount : 0);
+	Omission->SetNumberField(TEXT("omittedNodeCount"), bNonByteBoundViolation ? TotalNodeCount : 0);
+	Omission->SetNumberField(TEXT("omittedPinCount"), bNonByteBoundViolation ? TotalPinCount : 0);
+	Omission->SetNumberField(TEXT("omittedConnectionCount"), bNonByteBoundViolation ? TotalConnectionCount : 0);
 	Result->SetObjectField(TEXT("omission"), Omission);
 
 	FinishDirtyState(Result, Package, bDirtyBefore);
 	const bool bCountReconciled = SerializedNodeCount == TotalNodeCount
 		&& SerializedPinCount == TotalPinCount
 		&& SerializedConnectionCount + UnresolvedEndpointCount == TotalConnectionCount;
-	const bool bCapturedSetReconciled = !bDataOmitted && GraphsJson.Num() == CapturedGraphCount;
+	const bool bCapturedSetReconciled = !bNonByteBoundViolation && GraphsJson.Num() == CapturedGraphCount;
 	const bool bTopologyComplete = bGraphInventoryComplete
 		&& bCapturedSetReconciled
 		&& bCountReconciled
@@ -787,15 +866,137 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ReadBlueprintTopology(const TSharedPt
 		&& UnclassifiedGraphCount == 0
 		&& UnresolvedEndpointCount == 0
 		&& DuplicatePinIdentityCount == 0
-		&& !bDataOmitted
+		&& !bNonByteBoundViolation
 		&& !Result->GetBoolField(TEXT("dirtyStateChanged"));
 	Result->SetBoolField(TEXT("topologyComplete"), bTopologyComplete);
 	Result->SetBoolField(TEXT("complete"), bTopologyComplete);
 	Result->SetBoolField(TEXT("countsReconciled"), bCountReconciled);
 	Result->SetBoolField(TEXT("capturedSetReconciled"), bCapturedSetReconciled);
-	if (!bDataOmitted)
+	Result->SetStringField(TEXT("status"), bNonByteBoundViolation
+		? TEXT("omitted") : (bTopologyComplete ? TEXT("exact") : TEXT("partial")));
+
+	if (bNonByteBoundViolation)
 	{
-		Result->SetStringField(TEXT("status"), bTopologyComplete ? TEXT("exact") : TEXT("partial"));
+		return MCPResult(Result);
 	}
+
+	// Stabilize the self-reported byte count, then freeze the exact canonical
+	// logical result. Multipart delivery changes only transport; the bytes decode
+	// to the same spacehead.full-blueprint-topology@1.0 payload as inline delivery.
+	TArray<uint8> FrozenBytes;
+	for (int32 Attempt = 0; Attempt < 4; ++Attempt)
+	{
+		if (!SerializeUtf8(Result, FrozenBytes)) return MCPError(TEXT("Failed to serialize Full Blueprint topology"));
+		const int32 PriorSize = static_cast<int32>(Result->GetNumberField(TEXT("serializedPayloadBytes")));
+		if (PriorSize == FrozenBytes.Num()) break;
+		Result->SetNumberField(TEXT("serializedPayloadBytes"), FrozenBytes.Num());
+	}
+	if (!SerializeUtf8(Result, FrozenBytes)) return MCPError(TEXT("Failed to freeze Full Blueprint topology"));
+	Result->SetNumberField(TEXT("serializedPayloadBytes"), FrozenBytes.Num());
+	TArray<uint8> VerifiedFrozenBytes;
+	if (!SerializeUtf8(Result, VerifiedFrozenBytes)) return MCPError(TEXT("Failed to verify Full Blueprint topology size"));
+	if (VerifiedFrozenBytes.Num() != FrozenBytes.Num())
+	{
+		FrozenBytes = MoveTemp(VerifiedFrozenBytes);
+		Result->SetNumberField(TEXT("serializedPayloadBytes"), FrozenBytes.Num());
+		if (!SerializeUtf8(Result, FrozenBytes)) return MCPError(TEXT("Failed to finalize Full Blueprint topology size"));
+	}
+
+	if (FrozenBytes.Num() <= Limits.MaxSerializedBytes)
+	{
+		return MCPResult(Result);
+	}
+
+	CleanupExpiredFullTopologyCaptures();
+	if (FrozenBytes.Num() > MultipartMaxRetainedBytes)
+	{
+		return MCPError(FString::Printf(TEXT("Full Blueprint capture-capacity-exceeded: %d bytes exceed retained-byte quota %lld"),
+			FrozenBytes.Num(), MultipartMaxRetainedBytes));
+	}
+	if (FullTopologyCaptures.Num() >= MultipartMaxActiveCaptures
+		|| FullTopologyRetainedBytes + FrozenBytes.Num() > MultipartMaxRetainedBytes)
+	{
+		return MCPError(TEXT("Full Blueprint capture-capacity-exceeded: active capture quota is full"));
+	}
+
+	FFullTopologyCapture Capture;
+	Capture.Handle = NewCaptureHandle();
+	Capture.AssetPath = AssetPath;
+	Capture.ObjectPath = BlueprintObjectPath;
+	Capture.InventoryHash = InventoryHash;
+	Capture.InventoryToken = TEXT("sha1:") + InventoryHash;
+	Capture.SnapshotHash = Sha256Bytes(FrozenBytes);
+	if (Capture.SnapshotHash.IsEmpty()) return MCPError(TEXT("Failed to hash frozen Full Blueprint topology"));
+	Capture.CreatedAtUtc = FDateTime::UtcNow();
+	Capture.ExpiresAtUtc = Capture.CreatedAtUtc + FTimespan::FromSeconds(MultipartCaptureTtlSeconds);
+	Capture.FrozenBytes = MoveTemp(FrozenBytes);
+	FullTopologyRetainedBytes += Capture.FrozenBytes.Num();
+	const FString CaptureHandle = Capture.Handle;
+	FullTopologyCaptures.Add(CaptureHandle, MoveTemp(Capture));
+	return MCPResult(CaptureManifest(FullTopologyCaptures.FindChecked(CaptureHandle)));
+}
+
+TSharedPtr<FJsonValue> FBlueprintHandlers::ReadBlueprintTopologyChunk(const TSharedPtr<FJsonObject>& Params)
+{
+	FString CaptureHandle;
+	if (auto Error = RequireString(Params, TEXT("captureHandle"), CaptureHandle)) return Error;
+	double ChunkIndexNumber = -1.0;
+	if (!Params.IsValid() || !Params->TryGetNumberField(TEXT("chunkIndex"), ChunkIndexNumber)
+		|| ChunkIndexNumber < 0.0 || ChunkIndexNumber != FMath::FloorToDouble(ChunkIndexNumber)
+		|| ChunkIndexNumber > MAX_int32)
+	{
+		return MCPError(TEXT("chunkIndex must be a non-negative integer"));
+	}
+
+	CleanupExpiredFullTopologyCaptures();
+	const FFullTopologyCapture* Capture = FullTopologyCaptures.Find(CaptureHandle);
+	if (!Capture) return MCPError(TEXT("Full Blueprint capture handle was not found, expired, or released"));
+	const int32 ChunkIndex = static_cast<int32>(ChunkIndexNumber);
+	const int32 ChunkCount = FMath::DivideAndRoundUp(Capture->FrozenBytes.Num(), MultipartRawChunkBytes);
+	if (ChunkIndex >= ChunkCount) return MCPError(TEXT("Full Blueprint capture chunk index is out of range"));
+
+	const int32 Offset = ChunkIndex * MultipartRawChunkBytes;
+	const int32 RawByteCount = FMath::Min(MultipartRawChunkBytes, Capture->FrozenBytes.Num() - Offset);
+	TArray<uint8> ChunkBytes;
+	ChunkBytes.Append(Capture->FrozenBytes.GetData() + Offset, RawByteCount);
+	const FString ChunkHash = Sha256Bytes(ChunkBytes);
+	if (ChunkHash.IsEmpty()) return MCPError(TEXT("Failed to hash Full Blueprint capture chunk"));
+
+	TSharedPtr<FJsonObject> Result = MCPSuccess();
+	Result->SetStringField(TEXT("contractVersion"), TEXT("spacehead.full-blueprint-topology-chunk@1.0"));
+	Result->SetStringField(TEXT("captureHandle"), Capture->Handle);
+	Result->SetStringField(TEXT("assetPath"), Capture->AssetPath);
+	Result->SetStringField(TEXT("objectPath"), Capture->ObjectPath);
+	Result->SetNumberField(TEXT("chunkIndex"), ChunkIndex);
+	Result->SetNumberField(TEXT("chunkCount"), ChunkCount);
+	Result->SetNumberField(TEXT("offset"), Offset);
+	Result->SetNumberField(TEXT("rawByteCount"), RawByteCount);
+	Result->SetNumberField(TEXT("totalBytes"), Capture->FrozenBytes.Num());
+	Result->SetStringField(TEXT("encoding"), TEXT("base64"));
+	Result->SetStringField(TEXT("data"), FBase64::Encode(ChunkBytes));
+	Result->SetStringField(TEXT("chunkHash"), ChunkHash);
+	Result->SetStringField(TEXT("chunkHashAlgorithm"), TEXT("sha256"));
+	Result->SetStringField(TEXT("snapshotHash"), Capture->SnapshotHash);
+	Result->SetBoolField(TEXT("unrealAccessed"), false);
+	Result->SetBoolField(TEXT("mutationOperationsPerformed"), false);
+	return MCPResult(Result);
+}
+
+TSharedPtr<FJsonValue> FBlueprintHandlers::ReleaseBlueprintTopologyCapture(const TSharedPtr<FJsonObject>& Params)
+{
+	FString CaptureHandle;
+	if (auto Error = RequireString(Params, TEXT("captureHandle"), CaptureHandle)) return Error;
+	CleanupExpiredFullTopologyCaptures();
+	const FFullTopologyCapture* Capture = FullTopologyCaptures.Find(CaptureHandle);
+	if (!Capture) return MCPError(TEXT("Full Blueprint capture handle was not found, expired, or released"));
+	FullTopologyRetainedBytes -= Capture->FrozenBytes.Num();
+	FullTopologyCaptures.Remove(CaptureHandle);
+
+	TSharedPtr<FJsonObject> Result = MCPSuccess();
+	Result->SetStringField(TEXT("contractVersion"), TEXT("spacehead.full-blueprint-topology-release@1.0"));
+	Result->SetStringField(TEXT("captureHandle"), CaptureHandle);
+	Result->SetBoolField(TEXT("released"), true);
+	Result->SetBoolField(TEXT("unrealAccessed"), false);
+	Result->SetBoolField(TEXT("mutationOperationsPerformed"), false);
 	return MCPResult(Result);
 }

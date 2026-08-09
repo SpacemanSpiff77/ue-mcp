@@ -2,8 +2,9 @@
 
 `blueprint.read_blueprint_topology` is a native, read-only provider for a
 complete local graph inventory and exact supported topology for one Blueprint.
-It uses the contract `spacehead.full-blueprint-topology@1.0` and makes one
-bridge call; it does not compose `list_graphs` and `read_graph`.
+It observes Unreal once on the game thread and produces the logical contract
+`spacehead.full-blueprint-topology@1.0`; it does not compose `list_graphs`,
+`read_graph`, or repeated live graph reads.
 
 ## Inventory
 
@@ -57,13 +58,28 @@ presentation nodes are valid. Delegate signature graphs are inventory-only.
 
 Defaults are 64 authored graphs, 512 nodes/4,096 pins/8,192 connections per
 graph, 4,096 nodes/32,768 pins/65,536 connections across captured graphs, and
-a 3.5 MiB serialized payload target. Safe hard maxima are returned in
+a 3.5 MiB inline serialized payload boundary. Safe hard maxima are returned in
 `limits`.
 
-Bounds are all-or-nothing. If any count or payload bound is exceeded, the
+Graph and topology-count bounds are all-or-nothing. If one is exceeded, the
 provider returns the complete inventory, totals, limits, and omission
-violations with an empty `graphs` array, `truncated: true`,
-`dataOmitted: true`, and `allOrNothing: true`.
+violations with an empty `graphs` array, `truncated: true`, `dataOmitted: true`,
+and `allOrNothing: true`.
+
+Serialized size is a transport boundary, not a topology qualification bound.
+Qualified results at or below the inline boundary are returned normally.
+Larger results are frozen as canonical UTF-8 bytes during that same Unreal
+observation and the first call returns
+`spacehead.full-blueprint-topology-multipart@1.0`. The manifest contains an
+opaque capture handle, total length, 2 MiB raw chunk bound, chunk count,
+inventory evidence, expiry, and SHA-256 `snapshotHash`.
+
+`blueprint.read_blueprint_topology_chunk` returns one deterministic base64
+chunk from frozen memory with its exact index, offset, raw length, SHA-256, and
+manifest association. It never re-reads Unreal. Captures expire after five
+minutes and are also bounded by active-capture and retained-byte quotas.
+`blueprint.release_blueprint_topology_capture` releases a capture explicitly.
+Wrong, expired, or released handles and invalid indexes fail explicitly.
 
 ## Current support boundary
 

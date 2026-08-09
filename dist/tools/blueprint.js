@@ -10,7 +10,7 @@ export const blueprintTool = categoryTool("blueprint", "Blueprint reading, autho
         timeoutMs: 180_000,
     },
     read_blueprint_topology: {
-        ...bp("Deterministic, bounded, read-only complete Blueprint graph inventory and exact topology. Pointer-deduplicates all UE 5.8 Blueprint graph collections, audits owned UEdGraph objects, classifies exclusions and unsupported graphs explicitly, and returns topology atomically or an all-or-nothing omission. Params: assetPath, maxAuthoredGraphs?, maxNodesPerGraph?, maxPinsPerGraph?, maxConnectionsPerGraph?, maxTotalNodes?, maxTotalPins?, maxTotalConnections?, maxSerializedBytes?", "read_blueprint_topology", (p) => ({
+        ...bp("Deterministic, bounded, read-only complete Blueprint graph inventory and exact topology. Pointer-deduplicates all UE 5.8 Blueprint graph collections, audits owned UEdGraph objects, classifies exclusions and unsupported graphs explicitly, and returns small topology inline or an immutable multipart capture manifest. Non-byte bounds remain all-or-nothing. Params: assetPath, maxAuthoredGraphs?, maxNodesPerGraph?, maxPinsPerGraph?, maxConnectionsPerGraph?, maxTotalNodes?, maxTotalPins?, maxTotalConnections?, maxSerializedBytes?", "read_blueprint_topology", (p) => ({
             path: p.assetPath,
             maxAuthoredGraphs: p.maxAuthoredGraphs,
             maxNodesPerGraph: p.maxNodesPerGraph,
@@ -23,6 +23,8 @@ export const blueprintTool = categoryTool("blueprint", "Blueprint reading, autho
         })),
         timeoutMs: 180_000,
     },
+    read_blueprint_topology_chunk: bp("Fetch one deterministic base64 chunk from an immutable Full Blueprint topology capture. This reads frozen provider memory and never re-reads Unreal. Params: captureHandle, chunkIndex", "read_blueprint_topology_chunk", (p) => ({ captureHandle: p.captureHandle, chunkIndex: p.chunkIndex })),
+    release_blueprint_topology_capture: bp("Release an immutable Full Blueprint topology capture. This never reads or mutates Unreal. Params: captureHandle", "release_blueprint_topology_capture", (p) => ({ captureHandle: p.captureHandle })),
     read_graph_summary: bp("Lightweight graph summary (nodes+edges only, ~10KB). Filterable node list. Params: assetPath, graphName?, titleFilter?, classFilter? (#560)", "read_blueprint_graph_summary", (p) => ({ path: p.assetPath, graphName: p.graphName, titleFilter: p.titleFilter, classFilter: p.classFilter })),
     get_execution_flow: bp("Trace exec pins from an entry point. Params: assetPath, graphName?, entryPoint?", "get_blueprint_execution_flow", (p) => ({ path: p.assetPath, graphName: p.graphName, entryPoint: p.entryPoint })),
     get_dependencies: bp("Forward (classes/functions/assets) or reverse (referencers) deps. Params: assetPath, reverse?", "get_blueprint_dependencies", (p) => ({ path: p.assetPath, reverse: p.reverse })),
@@ -196,7 +198,9 @@ export const blueprintTool = categoryTool("blueprint", "Blueprint reading, autho
     maxTotalNodes: z.number().int().positive().optional().describe("read_blueprint_topology: whole-Blueprint node bound (default 4096, hard max 16384)"),
     maxTotalPins: z.number().int().positive().optional().describe("read_blueprint_topology: whole-Blueprint pin bound (default 32768, hard max 131072)"),
     maxTotalConnections: z.number().int().positive().optional().describe("read_blueprint_topology: whole-Blueprint connection bound (default 65536, hard max 262144)"),
-    maxSerializedBytes: z.number().int().positive().optional().describe("read_blueprint_topology: serialized payload target in bytes (default 3670016 / 3.5 MiB, hard max 8388608)"),
+    maxSerializedBytes: z.number().int().positive().optional().describe("read_blueprint_topology: inline serialized payload boundary in bytes (default 3670016 / 3.5 MiB, hard max 8388608); larger qualified results use immutable multipart delivery"),
+    captureHandle: z.string().min(32).optional().describe("Immutable Full Blueprint multipart capture handle"),
+    chunkIndex: z.number().int().nonnegative().optional().describe("Zero-based immutable Full Blueprint capture chunk index"),
     includePins: z.boolean().optional().describe("Include pins in read_graph results (default true)"),
     includeDefaults: z.boolean().optional().describe("Include pin default values in read_graph results (default true)"),
     includeComments: z.boolean().optional().describe("Include node comments in read_graph results (default true)"),
