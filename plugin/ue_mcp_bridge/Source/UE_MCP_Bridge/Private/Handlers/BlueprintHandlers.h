@@ -14,11 +14,15 @@ public:
 	// (e.g. AssetHandlers UserDefinedStruct authoring, #735) so a single mapping
 	// of "bool"/"int"/"Vector"/"Actor*"/etc. serves every authoring surface.
 	static struct FEdGraphPinType MakePinType(const FString& TypeStr);
+	// Read-only State Ledger fingerprint composition reuses the exact qualified
+	// serializers without exposing any compile/save/reconstruct operation.
+	static TSharedPtr<FJsonValue> ReadBlueprint(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ReadBlueprintTopology(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ReleaseBlueprintTopologyCapture(const TSharedPtr<FJsonObject>& Params);
 
 private:
 	// Handler implementations
 	static TSharedPtr<FJsonValue> CreateBlueprint(const TSharedPtr<FJsonObject>& Params);
-	static TSharedPtr<FJsonValue> ReadBlueprint(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> AddVariable(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> AddComponent(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> AddBlueprintInterface(const TSharedPtr<FJsonObject>& Params);
@@ -32,9 +36,7 @@ private:
 	static TSharedPtr<FJsonValue> AddNode(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ReadBlueprintGraph(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ReadBlueprintFunctionTopology(const TSharedPtr<FJsonObject>& Params);
-	static TSharedPtr<FJsonValue> ReadBlueprintTopology(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ReadBlueprintTopologyChunk(const TSharedPtr<FJsonObject>& Params);
-	static TSharedPtr<FJsonValue> ReleaseBlueprintTopologyCapture(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> AddEventDispatcher(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> RenameFunction(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> DeleteFunction(const TSharedPtr<FJsonObject>& Params);

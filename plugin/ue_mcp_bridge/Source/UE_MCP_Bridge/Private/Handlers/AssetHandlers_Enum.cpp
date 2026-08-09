@@ -17,6 +17,7 @@
 #include "EditorAssetLibrary.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
+#include "UObject/Package.h"
 
 // True for indices that are the implicit trailing "_MAX" sentinel UEnum keeps.
 static bool IsEnumMaxSentinel(const UEnum* Enum, int32 Index)
@@ -44,6 +45,12 @@ static TSharedPtr<FJsonObject> EnumeratorToJson(const UEnum* Enum, int32 Index)
 	V->SetStringField(TEXT("name"), Enum->GetNameStringByIndex(Index));
 	V->SetStringField(TEXT("displayName"), Enum->GetDisplayNameTextByIndex(Index).ToString());
 	V->SetNumberField(TEXT("value"), (double)Enum->GetValueByIndex(Index));
+	TSharedPtr<FJsonObject> Metadata = MakeShared<FJsonObject>();
+#if WITH_EDITOR
+	const FString Tooltip = Enum->GetMetaData(TEXT("ToolTip"), Index);
+	if (!Tooltip.IsEmpty()) Metadata->SetStringField(TEXT("tooltip"), Tooltip);
+#endif
+	V->SetObjectField(TEXT("metadata"), Metadata);
 	return V;
 }
 
@@ -138,9 +145,13 @@ TSharedPtr<FJsonValue> FAssetHandlers::ListEnumValues(const TSharedPtr<FJsonObje
 
 	UEnum* Enum = Cast<UEnum>(UEditorAssetLibrary::LoadAsset(AssetPath));
 	if (!Enum) return MCPError(FString::Printf(TEXT("Enum not found: %s"), *AssetPath));
+	UPackage* Package = Enum->GetOutermost();
+	const bool bDirtyBefore = Package && Package->IsDirty();
 
 	TSharedPtr<FJsonObject> Res = MCPSuccess();
+	Res->SetStringField(TEXT("contractVersion"), TEXT("spacehead.enum-definition@1.0"));
 	Res->SetStringField(TEXT("path"), AssetPath);
+	Res->SetStringField(TEXT("objectPath"), Enum->GetPathName());
 	Res->SetStringField(TEXT("name"), Enum->GetName());
 	Res->SetBoolField(TEXT("isUserDefined"), Enum->IsA<UUserDefinedEnum>());
 
@@ -152,6 +163,13 @@ TSharedPtr<FJsonValue> FAssetHandlers::ListEnumValues(const TSharedPtr<FJsonObje
 	}
 	Res->SetArrayField(TEXT("values"), Values);
 	Res->SetNumberField(TEXT("count"), Values.Num());
+	const bool bDirtyAfter = Package && Package->IsDirty();
+	Res->SetBoolField(TEXT("dirtyBefore"), bDirtyBefore);
+	Res->SetBoolField(TEXT("dirtyAfter"), bDirtyAfter);
+	Res->SetBoolField(TEXT("dirtyStateChanged"), bDirtyBefore != bDirtyAfter);
+	Res->SetBoolField(TEXT("mutationOperationsPerformed"), false);
+	Res->SetBoolField(TEXT("complete"), true);
+	if (bDirtyBefore != bDirtyAfter) return MCPError(TEXT("Read-only Enum traversal changed package dirty state"));
 	return MCPResult(Res);
 }
 

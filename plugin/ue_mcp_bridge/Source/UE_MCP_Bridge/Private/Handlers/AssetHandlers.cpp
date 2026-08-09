@@ -288,6 +288,7 @@ void FAssetHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("create_user_defined_struct"), &CreateUserDefinedStruct);
 	Registry.RegisterHandler(TEXT("list_struct_fields"), &ListStructFields);
 	Registry.RegisterHandler(TEXT("edit_user_defined_struct"), &EditUserDefinedStruct);
+	Registry.RegisterHandler(TEXT("read_state_ledger_fingerprint"), &ReadStateLedgerFingerprint);
 }
 
 // ---------------------------------------------------------------------------

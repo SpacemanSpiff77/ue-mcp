@@ -1156,12 +1156,125 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ReadBlueprint(const TSharedPtr<FJsonO
 	};
 
 	auto Result = MCPSuccess();
+	UPackage* Package = Blueprint->GetOutermost();
+	const bool bDirtyBefore = Package && Package->IsDirty();
+	Result->SetStringField(TEXT("contractVersion"), TEXT("spacehead.blueprint-structure@1.0"));
 	Result->SetStringField(TEXT("path"), AssetPath);
+	Result->SetStringField(TEXT("objectPath"), Blueprint->GetPathName());
 	Result->SetStringField(TEXT("className"), Blueprint->GetName());
+	Result->SetStringField(TEXT("classPath"), Blueprint->GetClass()->GetPathName());
 	if (Blueprint->ParentClass)
 	{
-		Result->SetStringField(TEXT("parentClass"), Blueprint->ParentClass->GetName());
+		Result->SetStringField(TEXT("parentClass"), Blueprint->ParentClass->GetPathName());
 	}
+
+	auto ContainerTypeString = [](EPinContainerType Type) -> FString
+	{
+		switch (Type)
+		{
+		case EPinContainerType::Array: return TEXT("array");
+		case EPinContainerType::Set: return TEXT("set");
+		case EPinContainerType::Map: return TEXT("map");
+		default: return TEXT("none");
+		}
+	};
+	auto TerminalTypeJson = [](const FEdGraphTerminalType& Type) -> TSharedPtr<FJsonObject>
+	{
+		TSharedPtr<FJsonObject> Json = MakeShared<FJsonObject>();
+		Json->SetStringField(TEXT("category"), Type.TerminalCategory.ToString());
+		Json->SetStringField(TEXT("subCategory"), Type.TerminalSubCategory.ToString());
+		const UObject* Object = Type.TerminalSubCategoryObject.Get();
+		Json->SetStringField(TEXT("subCategoryObject"), Object ? Object->GetPathName() : FString());
+		Json->SetBoolField(TEXT("isConst"), Type.bTerminalIsConst);
+		Json->SetBoolField(TEXT("isWeakPointer"), Type.bTerminalIsWeakPointer);
+		Json->SetBoolField(TEXT("isUObjectWrapper"), Type.bTerminalIsUObjectWrapper);
+		return Json;
+	};
+	auto PinTypeJson = [&ContainerTypeString, &TerminalTypeJson](const FEdGraphPinType& Type) -> TSharedPtr<FJsonObject>
+	{
+		TSharedPtr<FJsonObject> Json = MakeShared<FJsonObject>();
+		Json->SetStringField(TEXT("category"), Type.PinCategory.ToString());
+		Json->SetStringField(TEXT("subCategory"), Type.PinSubCategory.ToString());
+		const UObject* Object = Type.PinSubCategoryObject.Get();
+		Json->SetStringField(TEXT("subCategoryObject"), Object ? Object->GetPathName() : FString());
+		Json->SetStringField(TEXT("containerType"), ContainerTypeString(Type.ContainerType));
+		Json->SetBoolField(TEXT("isReference"), Type.bIsReference);
+		Json->SetBoolField(TEXT("isConst"), Type.bIsConst);
+		Json->SetBoolField(TEXT("isWeakPointer"), Type.bIsWeakPointer);
+		Json->SetBoolField(TEXT("isUObjectWrapper"), Type.bIsUObjectWrapper);
+		Json->SetObjectField(TEXT("valueTerminalType"), TerminalTypeJson(Type.PinValueType));
+		return Json;
+	};
+
+	TArray<FString> Interfaces;
+	for (const FBPInterfaceDescription& Interface : Blueprint->ImplementedInterfaces)
+	{
+		if (Interface.Interface) Interfaces.Add(Interface.Interface->GetPathName());
+	}
+	Interfaces.Sort();
+	TArray<TSharedPtr<FJsonValue>> InterfaceValues;
+	for (const FString& Interface : Interfaces) InterfaceValues.Add(MakeShared<FJsonValueString>(Interface));
+	Result->SetArrayField(TEXT("interfaces"), InterfaceValues);
+
+	TArray<TSharedPtr<FJsonValue>> Variables;
+	for (const FBPVariableDescription& Var : Blueprint->NewVariables)
+	{
+		TSharedPtr<FJsonObject> Json = MakeShared<FJsonObject>();
+		Json->SetStringField(TEXT("name"), Var.VarName.ToString());
+		Json->SetStringField(TEXT("guid"), Var.VarGuid.IsValid() ? Var.VarGuid.ToString(EGuidFormats::Digits) : FString());
+		Json->SetObjectField(TEXT("typeInfo"), PinTypeJson(Var.VarType));
+		Json->SetStringField(TEXT("containerType"), ContainerTypeString(Var.VarType.ContainerType));
+		Json->SetStringField(TEXT("defaultValue"), Var.DefaultValue);
+		Json->SetBoolField(TEXT("replicated"), (Var.PropertyFlags & CPF_Net) != 0);
+		Json->SetStringField(TEXT("repNotifyFunction"), Var.RepNotifyFunc.ToString());
+		Variables.Add(MakeShared<FJsonValueObject>(Json));
+	}
+	Result->SetArrayField(TEXT("variables"), Variables);
+
+	auto SignaturePins = [&PinTypeJson](UEdGraphNode* Node, EEdGraphPinDirection Direction)
+	{
+		TArray<TSharedPtr<FJsonValue>> Values;
+		if (!Node) return Values;
+		for (UEdGraphPin* Pin : Node->Pins)
+		{
+			if (!Pin || Pin->Direction != Direction || Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec) continue;
+			TSharedPtr<FJsonObject> Json = MakeShared<FJsonObject>();
+			Json->SetStringField(TEXT("name"), Pin->PinName.ToString());
+			Json->SetObjectField(TEXT("typeInfo"), PinTypeJson(Pin->PinType));
+			Json->SetStringField(TEXT("defaultValue"), Pin->DefaultValue);
+			Values.Add(MakeShared<FJsonValueObject>(Json));
+		}
+		return Values;
+	};
+	auto GraphSummary = [&SignaturePins](UEdGraph* Graph)
+	{
+		TSharedPtr<FJsonObject> Json = MakeShared<FJsonObject>();
+		Json->SetStringField(TEXT("name"), Graph ? Graph->GetName() : FString());
+		Json->SetStringField(TEXT("objectPath"), Graph ? Graph->GetPathName() : FString());
+		Json->SetStringField(TEXT("graphGuid"), Graph && Graph->GraphGuid.IsValid() ? Graph->GraphGuid.ToString(EGuidFormats::Digits) : FString());
+		UEdGraphNode* Entry = nullptr;
+		UEdGraphNode* ResultNode = nullptr;
+		if (Graph) for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			if (Cast<UK2Node_FunctionEntry>(Node)) Entry = Node;
+			else if (Node && Node->GetClass()->GetName() == TEXT("K2Node_FunctionResult")) ResultNode = Node;
+		}
+		Json->SetArrayField(TEXT("inputs"), SignaturePins(Entry, EGPD_Output));
+		Json->SetArrayField(TEXT("outputs"), SignaturePins(ResultNode, EGPD_Input));
+		return Json;
+	};
+	TArray<TSharedPtr<FJsonValue>> Functions;
+	for (UEdGraph* Graph : Blueprint->FunctionGraphs) if (Graph) Functions.Add(MakeShared<FJsonValueObject>(GraphSummary(Graph)));
+	Result->SetArrayField(TEXT("functions"), Functions);
+	TArray<TSharedPtr<FJsonValue>> Dispatchers;
+	for (UEdGraph* Graph : Blueprint->DelegateSignatureGraphs) if (Graph) Dispatchers.Add(MakeShared<FJsonValueObject>(GraphSummary(Graph)));
+	Result->SetArrayField(TEXT("dispatchers"), Dispatchers);
+	TArray<UEdGraph*> AllGraphs;
+	Blueprint->GetAllGraphs(AllGraphs);
+	AllGraphs.Sort([](const UEdGraph& A, const UEdGraph& B) { return A.GetPathName() < B.GetPathName(); });
+	TArray<TSharedPtr<FJsonValue>> GraphInventory;
+	for (UEdGraph* Graph : AllGraphs) if (Graph) GraphInventory.Add(MakeShared<FJsonValueObject>(GraphSummary(Graph)));
+	Result->SetArrayField(TEXT("graphs"), GraphInventory);
 
 	// Enumerate SCS components
 	TArray<TSharedPtr<FJsonValue>> ComponentsArray;
@@ -1186,6 +1299,8 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ReadBlueprint(const TSharedPtr<FJsonO
 			TSharedPtr<FJsonObject> CompObj = MakeShared<FJsonObject>();
 			CompObj->SetStringField(TEXT("name"), Node->GetVariableName().ToString());
 			CompObj->SetStringField(TEXT("class"), Template->GetClass()->GetName());
+			CompObj->SetStringField(TEXT("classPath"), Template->GetClass()->GetPathName());
+			CompObj->SetStringField(TEXT("origin"), TEXT("simple-construction-script"));
 
 			// Parent component
 			if (USCS_Node** ParentPtr = ParentMap.Find(Node))
@@ -1289,6 +1404,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ReadBlueprint(const TSharedPtr<FJsonO
 				TSharedPtr<FJsonObject> CompObj = MakeShared<FJsonObject>();
 				CompObj->SetStringField(TEXT("name"), Comp->GetName());
 				CompObj->SetStringField(TEXT("class"), Comp->GetClass()->GetName());
+				CompObj->SetStringField(TEXT("classPath"), Comp->GetClass()->GetPathName());
 				CompObj->SetStringField(TEXT("origin"), TEXT("native"));
 				if (USceneComponent* SC = Cast<USceneComponent>(Comp))
 				{
@@ -1303,6 +1419,13 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ReadBlueprint(const TSharedPtr<FJsonO
 			}
 		}
 	}
+	ComponentsArray.Sort([](const TSharedPtr<FJsonValue>& A, const TSharedPtr<FJsonValue>& B)
+	{
+		const TSharedPtr<FJsonObject> Left = A.IsValid() ? A->AsObject() : nullptr;
+		const TSharedPtr<FJsonObject> Right = B.IsValid() ? B->AsObject() : nullptr;
+		return (Left.IsValid() ? Left->GetStringField(TEXT("name")) : FString())
+			< (Right.IsValid() ? Right->GetStringField(TEXT("name")) : FString());
+	});
 	Result->SetArrayField(TEXT("components"), ComponentsArray);
 
 	// #116: expose actor tick settings from the CDO
@@ -1318,6 +1441,16 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ReadBlueprint(const TSharedPtr<FJsonO
 		}
 	}
 
+	const bool bDirtyAfter = Package && Package->IsDirty();
+	Result->SetBoolField(TEXT("dirtyBefore"), bDirtyBefore);
+	Result->SetBoolField(TEXT("dirtyAfter"), bDirtyAfter);
+	Result->SetBoolField(TEXT("dirtyStateChanged"), bDirtyBefore != bDirtyAfter);
+	Result->SetBoolField(TEXT("mutationOperationsPerformed"), false);
+	Result->SetBoolField(TEXT("compileRequested"), false);
+	Result->SetBoolField(TEXT("saveRequested"), false);
+	Result->SetBoolField(TEXT("reconstructRequested"), false);
+	Result->SetBoolField(TEXT("complete"), true);
+	if (bDirtyBefore != bDirtyAfter) return MCPError(TEXT("Read-only Blueprint structure traversal changed package dirty state"));
 	return MCPResult(Result);
 }
 

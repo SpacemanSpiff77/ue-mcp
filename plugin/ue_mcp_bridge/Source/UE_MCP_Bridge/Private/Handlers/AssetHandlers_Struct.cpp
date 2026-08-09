@@ -22,6 +22,7 @@
 #include "EditorAssetLibrary.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
+#include "UObject/Package.h"
 
 // Human-readable type label for one member (e.g. "int", "Vector (struct)",
 // "Actor (object)", "int[]"). Best-effort; agents mainly key off name/guid.
@@ -51,6 +52,31 @@ static TSharedPtr<FJsonObject> StructFieldToJson(const FStructVariableDescriptio
 	V->SetStringField(TEXT("friendlyName"), Desc.FriendlyName);
 	V->SetStringField(TEXT("guid"), Desc.VarGuid.ToString());
 	V->SetStringField(TEXT("type"), StructFieldTypeLabel(Desc));
+	V->SetStringField(TEXT("category"), Desc.Category.ToString());
+	V->SetStringField(TEXT("subCategory"), Desc.SubCategory.ToString());
+	V->SetStringField(TEXT("subCategoryObject"), Desc.SubCategoryObject.IsNull() ? FString() : Desc.SubCategoryObject.ToString());
+	switch (Desc.ContainerType)
+	{
+	case EPinContainerType::Array: V->SetStringField(TEXT("containerType"), TEXT("array")); break;
+	case EPinContainerType::Set: V->SetStringField(TEXT("containerType"), TEXT("set")); break;
+	case EPinContainerType::Map: V->SetStringField(TEXT("containerType"), TEXT("map")); break;
+	default: V->SetStringField(TEXT("containerType"), TEXT("none")); break;
+	}
+	V->SetStringField(TEXT("defaultValue"), Desc.DefaultValue);
+	V->SetStringField(TEXT("currentDefaultValue"), Desc.CurrentDefaultValue);
+	V->SetBoolField(TEXT("defaultValueAvailable"), true);
+	TSharedPtr<FJsonObject> ValueType = MakeShared<FJsonObject>();
+	ValueType->SetStringField(TEXT("category"), Desc.PinValueType.TerminalCategory.ToString());
+	ValueType->SetStringField(TEXT("subCategory"), Desc.PinValueType.TerminalSubCategory.ToString());
+	const UObject* ValueObject = Desc.PinValueType.TerminalSubCategoryObject.Get();
+	ValueType->SetStringField(TEXT("subCategoryObject"), ValueObject ? ValueObject->GetPathName() : FString());
+	ValueType->SetBoolField(TEXT("isConst"), Desc.PinValueType.bTerminalIsConst);
+	ValueType->SetBoolField(TEXT("isWeakPointer"), Desc.PinValueType.bTerminalIsWeakPointer);
+	ValueType->SetBoolField(TEXT("isUObjectWrapper"), Desc.PinValueType.bTerminalIsUObjectWrapper);
+	V->SetObjectField(TEXT("valueType"), ValueType);
+	TSharedPtr<FJsonObject> Metadata = MakeShared<FJsonObject>();
+	for (const TPair<FName, FString>& Pair : Desc.MetaData) Metadata->SetStringField(Pair.Key.ToString(), Pair.Value);
+	V->SetObjectField(TEXT("metadata"), Metadata);
 	return V;
 }
 
@@ -170,9 +196,13 @@ TSharedPtr<FJsonValue> FAssetHandlers::ListStructFields(const TSharedPtr<FJsonOb
 
 	UUserDefinedStruct* Struct = Cast<UUserDefinedStruct>(UEditorAssetLibrary::LoadAsset(AssetPath));
 	if (!Struct) return MCPError(FString::Printf(TEXT("UserDefinedStruct not found (native structs are not editable): %s"), *AssetPath));
+	UPackage* Package = Struct->GetOutermost();
+	const bool bDirtyBefore = Package && Package->IsDirty();
 
 	TSharedPtr<FJsonObject> Res = MCPSuccess();
+	Res->SetStringField(TEXT("contractVersion"), TEXT("spacehead.struct-definition@1.0"));
 	Res->SetStringField(TEXT("path"), AssetPath);
+	Res->SetStringField(TEXT("objectPath"), Struct->GetPathName());
 	Res->SetStringField(TEXT("name"), Struct->GetName());
 
 	TArray<TSharedPtr<FJsonValue>> FieldList;
@@ -183,6 +213,13 @@ TSharedPtr<FJsonValue> FAssetHandlers::ListStructFields(const TSharedPtr<FJsonOb
 	}
 	Res->SetArrayField(TEXT("fields"), FieldList);
 	Res->SetNumberField(TEXT("count"), FieldList.Num());
+	const bool bDirtyAfter = Package && Package->IsDirty();
+	Res->SetBoolField(TEXT("dirtyBefore"), bDirtyBefore);
+	Res->SetBoolField(TEXT("dirtyAfter"), bDirtyAfter);
+	Res->SetBoolField(TEXT("dirtyStateChanged"), bDirtyBefore != bDirtyAfter);
+	Res->SetBoolField(TEXT("mutationOperationsPerformed"), false);
+	Res->SetBoolField(TEXT("complete"), true);
+	if (bDirtyBefore != bDirtyAfter) return MCPError(TEXT("Read-only Struct traversal changed package dirty state"));
 	return MCPResult(Res);
 }
 

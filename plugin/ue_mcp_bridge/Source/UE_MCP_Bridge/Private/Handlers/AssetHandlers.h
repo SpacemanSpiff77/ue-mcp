@@ -156,4 +156,5 @@ private:
 	static TSharedPtr<FJsonValue> CreateUserDefinedStruct(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ListStructFields(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> EditUserDefinedStruct(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ReadStateLedgerFingerprint(const TSharedPtr<FJsonObject>& Params);
 };
