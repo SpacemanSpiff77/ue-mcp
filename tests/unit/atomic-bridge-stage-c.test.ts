@@ -40,5 +40,6 @@ describe("atomic Builder Stage C bounded multi-operation contract", () => {
       "AFTER_ROLLBACK_BEFORE_FINAL_RECEIPT"])
       expect(handler).toContain(checkpoint);
     expect(handler).toContain('RollbackWholeBuild(TEXT("SAVE"), TEXT("FORCED_SAVE_FAILURE"), FailingOperation, false)');
+    expect(handler).toContain('FaultCheckpoint == TEXT("AFTER_ROLLBACK_BEFORE_FINAL_RECEIPT") && Index == Operations->Num() - 1');
   });
 });

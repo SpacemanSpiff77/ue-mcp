@@ -1389,7 +1389,8 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			const int32 Middle = Operations->Num() / 2;
 			if ((FaultCheckpoint == TEXT("AFTER_FIRST_MUTATION") && Index == 0)
 				|| (FaultCheckpoint == TEXT("AFTER_MIDDLE_MUTATION") && Index == Middle)
-				|| (FaultCheckpoint == TEXT("AFTER_FINAL_MUTATION") && Index == Operations->Num() - 1))
+				|| (FaultCheckpoint == TEXT("AFTER_FINAL_MUTATION") && Index == Operations->Num() - 1)
+				|| (FaultCheckpoint == TEXT("AFTER_ROLLBACK_BEFORE_FINAL_RECEIPT") && Index == Operations->Num() - 1))
 				return RollbackWholeBuild(TEXT("MUTATION"), TEXT("FORCED_OPERATION_FAILURE"), OperationId, false);
 		}
 
