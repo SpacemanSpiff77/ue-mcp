@@ -1,6 +1,7 @@
 #include "BlueprintHandlers.h"
 #include "BlueprintTopologySerializer.h"
 #include "HandlerUtils.h"
+#include "AtomicBridgeBuildIdentity.generated.h"
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -12,7 +13,7 @@
 #include "Engine/Blueprint.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
-#include "Internationalization/Regex.h"
+#include "Interfaces/IPluginManager.h"
 #include "Kismet2/CompilerResultsLog.h"
 #include "Kismet2/KismetEditorUtilities.h"
 #include "Misc/EngineVersion.h"
@@ -35,9 +36,8 @@ namespace
 	const TCHAR* TopologyVersion = TEXT("spacehead.blueprint-semantic-topology@1.0");
 	const TCHAR* UeMcpVersion = TEXT("1.1.36");
 	const TCHAR* BridgeVersion = TEXT("0.3.0");
-	const TCHAR* PluginBuildIdentity = TEXT("spacehead-pass2-atomic-build@1");
-	const TCHAR* InputSchemaIdentity = TEXT("spacehead.blueprint-atomic-bridge.request@1.0");
-	const TCHAR* OutputSchemaIdentity = TEXT("spacehead.blueprint-atomic-bridge.receipt@1.0");
+	const TCHAR* InputSchemaVersion = TEXT("spacehead.blueprint-atomic-bridge.request@1.0");
+	const TCHAR* OutputSchemaVersion = TEXT("spacehead.blueprint-atomic-bridge.receipt@1.0");
 
 	struct FCachedAtomicExecution
 	{
@@ -120,6 +120,60 @@ namespace
 		return ScalarJson(Value);
 	}
 
+	bool IsSchemaAnnotation(const FString& Key)
+	{
+		return Key == TEXT("$comment") || Key == TEXT("$id") || Key == TEXT("$schema")
+			|| Key == TEXT("description") || Key == TEXT("examples") || Key == TEXT("title")
+			|| Key == TEXT("x-spacehead-schema-version");
+	}
+
+	bool IsUnorderedSchemaArray(const FString& Key)
+	{
+		return Key == TEXT("allOf") || Key == TEXT("anyOf") || Key == TEXT("enum")
+			|| Key == TEXT("oneOf") || Key == TEXT("required") || Key == TEXT("type");
+	}
+
+	FString CanonicalSchemaJsonValue(const TSharedPtr<FJsonValue>& Value, const FString& ParentKey = FString());
+
+	FString CanonicalSchemaJsonObject(const TSharedPtr<FJsonObject>& Object)
+	{
+		if (!Object.IsValid()) return TEXT("null");
+		TArray<TPair<FString, TSharedPtr<FJsonValue>>> Fields;
+		for (const auto& Pair : Object->Values)
+		{
+			const FString Key(*Pair.Key);
+			if (!IsSchemaAnnotation(Key)) Fields.Emplace(Key, Pair.Value);
+		}
+		Fields.Sort([](const TPair<FString, TSharedPtr<FJsonValue>>& A,
+			const TPair<FString, TSharedPtr<FJsonValue>>& B) { return A.Key < B.Key; });
+		FString Result = TEXT("{");
+		for (int32 Index = 0; Index < Fields.Num(); ++Index)
+		{
+			if (Index > 0) Result += TEXT(",");
+			Result += ScalarJson(MakeShared<FJsonValueString>(Fields[Index].Key));
+			Result += TEXT(":");
+			Result += CanonicalSchemaJsonValue(Fields[Index].Value, Fields[Index].Key);
+		}
+		return Result + TEXT("}");
+	}
+
+	FString CanonicalSchemaJsonValue(const TSharedPtr<FJsonValue>& Value, const FString& ParentKey)
+	{
+		if (!Value.IsValid() || Value->IsNull()) return TEXT("null");
+		if (Value->Type == EJson::Object) return CanonicalSchemaJsonObject(Value->AsObject());
+		if (Value->Type == EJson::Array)
+		{
+			TArray<FString> Items;
+			for (const TSharedPtr<FJsonValue>& Item : Value->AsArray())
+			{
+				Items.Add(CanonicalSchemaJsonValue(Item));
+			}
+			if (IsUnorderedSchemaArray(ParentKey)) Items.Sort();
+			return TEXT("[") + FString::Join(Items, TEXT(",")) + TEXT("]");
+		}
+		return ScalarJson(Value);
+	}
+
 	FString Sha256(const FString& Value)
 	{
 		const FTCHARToUTF8 Utf8(*Value);
@@ -181,6 +235,32 @@ namespace
 		return true;
 	}
 
+	bool AtomicSchemaDigest(const TCHAR* FileName, const TCHAR* ExpectedVersion, FString& Digest)
+	{
+		const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("UE_MCP_Bridge"));
+		if (!Plugin.IsValid()) return false;
+		const FString Path = FPaths::Combine(Plugin->GetBaseDir(), TEXT("Contracts"), TEXT("AtomicBlueprint"), FileName);
+		FString SchemaText;
+		TSharedPtr<FJsonObject> Schema;
+		if (!FFileHelper::LoadFileToString(SchemaText, *Path)) return false;
+		const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(SchemaText);
+		if (!FJsonSerializer::Deserialize(Reader, Schema) || !Schema.IsValid()) return false;
+		FString Version;
+		if (!Schema->TryGetStringField(TEXT("x-spacehead-schema-version"), Version)
+			|| Version != ExpectedVersion) return false;
+		Digest = Sha256(CanonicalSchemaJsonObject(Schema));
+		return ValidHash(Digest);
+	}
+
+	bool ExactBridgeBuildIdentityAvailable()
+	{
+		const FString GitCommit = UE_MCP_AtomicBuildIdentity::GitCommit;
+		const FString Fingerprint = UE_MCP_AtomicBuildIdentity::BuildFingerprint;
+		if (GitCommit.Len() != 40 || !ValidHash(Fingerprint)) return false;
+		for (TCHAR Character : GitCommit) if (!FChar::IsHexDigit(Character)) return false;
+		return true;
+	}
+
 	TSharedPtr<FJsonObject> CloneObject(const TSharedPtr<FJsonObject>& Object)
 	{
 		TSharedPtr<FJsonObject> Clone;
@@ -228,6 +308,7 @@ namespace
 		const TCHAR* State)
 	{
 		TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+		Result->SetStringField(TEXT("contract_version"), ContractVersion);
 		Result->SetStringField(TEXT("transaction_id"), TransactionId);
 		Result->SetStringField(TEXT("correlation_id"), CorrelationId);
 		Result->SetBoolField(TEXT("received_by_bridge"), true);
@@ -506,12 +587,18 @@ namespace
 
 	TSharedPtr<FJsonObject> Readiness()
 	{
+		FString InputDigest;
+		FString OutputDigest;
+		const bool bSchemasAvailable = AtomicSchemaDigest(TEXT("request-v1.schema.json"), InputSchemaVersion, InputDigest)
+			&& AtomicSchemaDigest(TEXT("receipt-v1.schema.json"), OutputSchemaVersion, OutputDigest);
 		TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 		Result->SetStringField(TEXT("contract_version"), ContractVersion);
-		Result->SetBoolField(TEXT("ready"), true);
+		Result->SetBoolField(TEXT("ready"), ExactBridgeBuildIdentityAvailable() && bSchemasAvailable);
 		Result->SetStringField(TEXT("bridge_identity"), EndpointIdentity);
 		Result->SetStringField(TEXT("environment_digest"), Sha256(
-			EngineIdentity() + TEXT("|") + UeMcpVersion + TEXT("|") + BridgeVersion + TEXT("|") + PluginBuildIdentity));
+			EngineIdentity() + TEXT("|") + UeMcpVersion + TEXT("|") + BridgeVersion + TEXT("|")
+			+ UE_MCP_AtomicBuildIdentity::GitCommit + TEXT("|") + UE_MCP_AtomicBuildIdentity::PluginBuildIdentity
+			+ TEXT("|") + InputDigest + TEXT("|") + OutputDigest));
 		Result->SetStringField(TEXT("observed_at"), FDateTime::UtcNow().ToIso8601());
 		Result->SetStringField(TEXT("raw_method_identity"), RawMethodIdentity);
 		return Result;
@@ -519,12 +606,20 @@ namespace
 
 	TSharedPtr<FJsonObject> Discovery()
 	{
+		FString InputDigest;
+		FString OutputDigest;
+		const bool bInputSchemaAvailable = AtomicSchemaDigest(TEXT("request-v1.schema.json"), InputSchemaVersion, InputDigest);
+		const bool bOutputSchemaAvailable = AtomicSchemaDigest(TEXT("receipt-v1.schema.json"), OutputSchemaVersion, OutputDigest);
+		const bool bBuildIdentityAvailable = ExactBridgeBuildIdentityAvailable();
 		TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 		Result->SetStringField(TEXT("discovery_version"), TEXT("spacehead.capability-discovery@1.0"));
 		Result->SetStringField(TEXT("ue_version"), EngineIdentity());
 		Result->SetStringField(TEXT("ue_mcp_version"), UeMcpVersion);
 		Result->SetStringField(TEXT("bridge_version"), BridgeVersion);
-		Result->SetStringField(TEXT("plugin_build_identity"), PluginBuildIdentity);
+		if (!FString(UE_MCP_AtomicBuildIdentity::GitCommit).IsEmpty())
+			Result->SetStringField(TEXT("bridge_git_commit"), UE_MCP_AtomicBuildIdentity::GitCommit);
+		Result->SetStringField(TEXT("bridge_build_fingerprint"), UE_MCP_AtomicBuildIdentity::BuildFingerprint);
+		Result->SetStringField(TEXT("plugin_build_identity"), UE_MCP_AtomicBuildIdentity::PluginBuildIdentity);
 		Result->SetStringField(TEXT("discovered_at"), FDateTime::UtcNow().ToIso8601());
 		Result->SetBoolField(TEXT("qualified"), false);
 		TSharedPtr<FJsonObject> Capability = MakeShared<FJsonObject>();
@@ -535,10 +630,18 @@ namespace
 		Capability->SetStringField(TEXT("tool_identity"), TEXT("blueprint"));
 		Capability->SetStringField(TEXT("action_identity"), RawMethodIdentity);
 		Capability->SetStringField(TEXT("raw_method_identity"), RawMethodIdentity);
-		Capability->SetStringField(TEXT("input_schema_digest"), Sha256(InputSchemaIdentity));
-		Capability->SetStringField(TEXT("output_schema_digest"), Sha256(OutputSchemaIdentity));
+		if (bInputSchemaAvailable)
+		{
+			Capability->SetStringField(TEXT("input_schema_version"), InputSchemaVersion);
+			Capability->SetStringField(TEXT("input_schema_digest"), InputDigest);
+		}
+		if (bOutputSchemaAvailable)
+		{
+			Capability->SetStringField(TEXT("output_schema_version"), OutputSchemaVersion);
+			Capability->SetStringField(TEXT("output_schema_digest"), OutputDigest);
+		}
 		Capability->SetBoolField(TEXT("enabled"), true);
-		Capability->SetBoolField(TEXT("available"), true);
+		Capability->SetBoolField(TEXT("available"), bBuildIdentityAvailable && bInputSchemaAvailable && bOutputSchemaAvailable);
 		Result->SetArrayField(TEXT("capabilities"), { MakeShared<FJsonValueObject>(Capability) });
 		return Result;
 	}

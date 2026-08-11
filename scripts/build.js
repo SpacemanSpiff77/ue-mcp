@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
 import path from 'path';
+import { createHash } from 'crypto';
+import { mkdir, readFile, writeFile } from 'fs/promises';
 import { spawn, exec } from 'child_process';
 import { promisify } from 'util';
 import { fileURLToPath } from 'url';
@@ -11,6 +13,40 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const execPromise = promisify(exec);
+
+const atomicFingerprintInputs = [
+  'Contracts/AtomicBlueprint/receipt-v1.schema.json',
+  'Contracts/AtomicBlueprint/request-v1.schema.json',
+  'Source/UE_MCP_Bridge/Private/Handlers/BlueprintTopologySerializer.cpp',
+  'Source/UE_MCP_Bridge/Private/Handlers/BlueprintTopologySerializer.h',
+  'Source/UE_MCP_Bridge/Private/Handlers/BlueprintHandlers.cpp',
+  'Source/UE_MCP_Bridge/Private/Handlers/BlueprintHandlers.h',
+  'Source/UE_MCP_Bridge/Private/Handlers/BlueprintHandlers_BuildSpec.cpp',
+  'Source/UE_MCP_Bridge/UE_MCP_Bridge.Build.cs',
+];
+
+async function generateAtomicBridgeBuildIdentity(projectRoot, gitCommit) {
+  const pluginRoot = path.join(projectRoot, 'Plugins', 'UE_MCP_Bridge');
+  const hash = createHash('sha256');
+  for (const relativePath of [...atomicFingerprintInputs].sort()) {
+    const relativeBytes = Buffer.from(relativePath, 'utf8');
+    const sourceBytes = await readFile(path.join(pluginRoot, ...relativePath.split('/')));
+    const relativeLength = Buffer.alloc(4);
+    relativeLength.writeInt32LE(relativeBytes.length);
+    const sourceLength = Buffer.alloc(4);
+    sourceLength.writeInt32LE(sourceBytes.length);
+    hash.update(relativeLength).update(relativeBytes).update(sourceLength).update(sourceBytes);
+  }
+  const fingerprint = hash.digest('hex');
+  const generatedDirectory = path.join(pluginRoot, 'Intermediate', 'Generated', 'AtomicBridgeBuildIdentity');
+  const generatedHeader = path.join(generatedDirectory, 'AtomicBridgeBuildIdentity.generated.h');
+  const contents = `#pragma once\n\nnamespace UE_MCP_AtomicBuildIdentity\n{\n\tstatic constexpr const TCHAR* GitCommit = TEXT("${gitCommit}");\n\tstatic constexpr const TCHAR* BuildFingerprint = TEXT("${fingerprint}");\n\tstatic constexpr const TCHAR* PluginBuildIdentity = TEXT("sha256:${fingerprint}");\n}\n`;
+  await mkdir(generatedDirectory, { recursive: true });
+  let existing = '';
+  try { existing = await readFile(generatedHeader, 'utf8'); } catch { /* generated on first build */ }
+  if (existing !== contents) await writeFile(generatedHeader, contents, 'utf8');
+  return fingerprint;
+}
 
 function runCommand(command, args, options = {}) {
   return new Promise((resolve, reject) => {
@@ -69,6 +105,7 @@ async function main() {
   logSection('UE-MCP Build');
 
   const { projectRoot, projectFile } = getProjectPaths();
+  const repositoryRoot = path.resolve(__dirname, '..');
 
   // Check if project file exists
   if (!(await fileExists(projectFile))) {
@@ -103,6 +140,8 @@ async function main() {
     `-Project="${projectFile}"`,
     '-WaitMutex',
     '-FromMsBuild',
+    '-NoHotReloadFromIDE',
+    '-NoUBTMakefiles',
   ];
 
   log('Starting build...');
@@ -110,8 +149,18 @@ async function main() {
   log('');
 
   try {
+    const { stdout: gitCommitOutput } = await execPromise('git rev-parse HEAD', { cwd: repositoryRoot });
+    const gitCommit = gitCommitOutput.trim().toLowerCase();
+    if (!/^[0-9a-f]{40}$/.test(gitCommit)) {
+      throw new Error('Could not determine an exact bridge Git commit for build metadata');
+    }
+    const buildFingerprint = await generateAtomicBridgeBuildIdentity(projectRoot, gitCommit);
+    log(`Bridge Git Commit: ${gitCommit}`);
+    log(`Bridge Build Fingerprint: ${buildFingerprint}`);
     // Run the build
-    await runCommand(buildTool, buildArgs);
+    await runCommand(buildTool, buildArgs, {
+      env: { ...process.env, SPACEHEAD_BRIDGE_GIT_COMMIT: gitCommit },
+    });
     
     logSection('Build succeeded!');
     process.exit(0);

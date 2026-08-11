@@ -1,0 +1,260 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "spacehead.blueprint-atomic-bridge.request@1.0",
+  "x-spacehead-schema-version": "spacehead.blueprint-atomic-bridge.request@1.0",
+  "title": "Spacehead atomic Blueprint bridge request",
+  "oneOf": [
+    { "$ref": "#/$defs/readinessRequest" },
+    { "$ref": "#/$defs/discoveryRequest" },
+    { "$ref": "#/$defs/canonicalVectorsRequest" },
+    { "$ref": "#/$defs/statusRequest" },
+    { "$ref": "#/$defs/dispatchRequest" }
+  ],
+  "$defs": {
+    "contractVersion": {
+      "const": "spacehead.blueprint-atomic-bridge@1.0"
+    },
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "readinessRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "request_kind"],
+      "properties": {
+        "contract_version": { "$ref": "#/$defs/contractVersion" },
+        "request_kind": { "const": "readiness" }
+      }
+    },
+    "discoveryRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "request_kind"],
+      "properties": {
+        "contract_version": { "$ref": "#/$defs/contractVersion" },
+        "request_kind": { "const": "discover" }
+      }
+    },
+    "canonicalVectorsRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "request_kind", "vectors"],
+      "properties": {
+        "contract_version": { "$ref": "#/$defs/contractVersion" },
+        "request_kind": { "const": "canonical_vectors" },
+        "vectors": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/semanticTopology" }
+        }
+      }
+    },
+    "statusRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "request_kind", "transaction_id", "correlation_id"],
+      "properties": {
+        "contract_version": { "$ref": "#/$defs/contractVersion" },
+        "request_kind": { "const": "status" },
+        "transaction_id": { "$ref": "#/$defs/nonEmptyString" },
+        "correlation_id": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "dispatchRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "request_kind", "transaction_id", "correlation_id", "build_spec", "plan", "fencing"],
+      "properties": {
+        "contract_version": { "$ref": "#/$defs/contractVersion" },
+        "request_kind": { "const": "dispatch" },
+        "transaction_id": { "$ref": "#/$defs/nonEmptyString" },
+        "correlation_id": { "$ref": "#/$defs/nonEmptyString" },
+        "build_spec": { "$ref": "#/$defs/buildSpec" },
+        "plan": { "$ref": "#/$defs/buildPlan" },
+        "fencing": { "$ref": "#/$defs/fencing" },
+        "test_hooks": { "$ref": "#/$defs/testHooks" }
+      }
+    },
+    "graphSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "name"],
+      "properties": {
+        "kind": { "enum": ["graph", "function"] },
+        "name": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["package_path", "blueprint_name", "graph_selectors"],
+      "properties": {
+        "package_path": {
+          "type": "string",
+          "pattern": "^/Game/Tests/Builder/[A-Za-z0-9_]+$"
+        },
+        "blueprint_name": { "$ref": "#/$defs/nonEmptyString" },
+        "graph_selectors": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": { "$ref": "#/$defs/graphSelector" }
+        }
+      }
+    },
+    "buildSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["spec_version", "request_id", "target", "operations", "policy"],
+      "properties": {
+        "spec_version": { "const": "spacehead.blueprint-build-spec@1.0" },
+        "request_id": { "$ref": "#/$defs/nonEmptyString" },
+        "target": { "$ref": "#/$defs/target" },
+        "operations": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": { "$ref": "#/$defs/buildSpecOperation" }
+        },
+        "policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["atomicity", "compile_without_save", "save_after_verification_only", "rollback_on_failure"],
+          "properties": {
+            "atomicity": { "const": "ONE_BLUEPRINT_PACKAGE" },
+            "compile_without_save": { "const": true },
+            "save_after_verification_only": { "const": true },
+            "rollback_on_failure": { "const": true }
+          }
+        }
+      }
+    },
+    "buildSpecOperation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation_id", "family", "kind", "operation_version", "depends_on", "payload"],
+      "properties": {
+        "operation_id": { "$ref": "#/$defs/nonEmptyString" },
+        "family": { "const": "graph" },
+        "kind": { "const": "set_pin_default" },
+        "operation_version": { "const": "graph.set-pin-default@1.0" },
+        "depends_on": { "type": "array", "maxItems": 0 },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["pin", "value"],
+          "properties": {
+            "pin": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["node", "pin_name", "direction"],
+              "properties": {
+                "node": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["kind", "node_guid"],
+                  "properties": {
+                    "kind": { "const": "existing" },
+                    "node_guid": { "$ref": "#/$defs/nonEmptyString" }
+                  }
+                },
+                "pin_name": { "$ref": "#/$defs/nonEmptyString" },
+                "direction": { "const": "input" }
+              }
+            },
+            "value": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "buildPlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["plan_version", "build_spec_canonical_hash", "target", "scanner_baseline", "capability_qualification_digest", "operations", "expected_delta", "unchanged_invariants", "policies", "resource_budget", "bindings", "freshness_evidence", "build_plan_canonical_hash"],
+      "properties": {
+        "plan_version": { "const": "spacehead.blueprint-build-plan@1.0" },
+        "build_spec_canonical_hash": { "$ref": "#/$defs/sha256" },
+        "target": { "$ref": "#/$defs/target" },
+        "scanner_baseline": { "type": "object" },
+        "capability_qualification_digest": { "$ref": "#/$defs/sha256" },
+        "operations": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": { "$ref": "#/$defs/buildPlanOperation" }
+        },
+        "expected_delta": { "type": "object" },
+        "unchanged_invariants": { "type": "array", "items": { "type": "string" } },
+        "policies": { "type": "object" },
+        "resource_budget": { "type": "object" },
+        "bindings": { "type": "object" },
+        "freshness_evidence": { "type": "object" },
+        "build_plan_canonical_hash": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "buildPlanOperation": {
+      "type": "object",
+      "required": ["operation_id", "semantic_capability_id", "capability_version", "operation_version", "depends_on", "existing_node_identities", "future_node_identities", "pin_expectations", "semantic_payload"],
+      "properties": {
+        "operation_id": { "$ref": "#/$defs/nonEmptyString" },
+        "semantic_capability_id": { "const": "graph.set-pin-default" },
+        "capability_version": { "const": "1.0" },
+        "operation_version": { "const": "graph.set-pin-default@1.0" },
+        "depends_on": { "type": "array", "maxItems": 0 },
+        "existing_node_identities": { "type": "array", "minItems": 1, "maxItems": 1 },
+        "future_node_identities": { "type": "array", "maxItems": 0 },
+        "pin_expectations": { "type": "array", "minItems": 1, "maxItems": 1 },
+        "semantic_payload": {
+          "type": "object",
+          "required": ["node_guid", "pin_id", "pin_name", "expected_current_value", "desired_value", "baseline_semantic_topology", "baseline_semantic_fingerprint"],
+          "properties": {
+            "node_guid": { "$ref": "#/$defs/nonEmptyString" },
+            "pin_id": { "$ref": "#/$defs/nonEmptyString" },
+            "pin_name": { "$ref": "#/$defs/nonEmptyString" },
+            "expected_current_value": { "type": "boolean" },
+            "desired_value": { "type": "boolean" },
+            "baseline_semantic_topology": { "$ref": "#/$defs/semanticTopology" },
+            "baseline_semantic_fingerprint": { "$ref": "#/$defs/sha256" }
+          }
+        }
+      }
+    },
+    "semanticTopology": {
+      "type": "object",
+      "required": ["topology_version", "graph", "nodes", "connections"],
+      "properties": {
+        "topology_version": { "const": "spacehead.blueprint-semantic-topology@1.0" },
+        "graph": { "type": "object" },
+        "nodes": { "type": "array", "items": { "type": "object" } },
+        "connections": { "type": "array", "items": { "type": "object" } },
+        "layout": {}
+      }
+    },
+    "fencing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_identity", "fencing_token", "fencing_sequence", "lock_owner_request_id", "issued_at"],
+      "properties": {
+        "target_identity": { "$ref": "#/$defs/nonEmptyString" },
+        "fencing_token": { "$ref": "#/$defs/nonEmptyString" },
+        "fencing_sequence": { "type": "integer", "minimum": 1 },
+        "lock_owner_request_id": { "$ref": "#/$defs/nonEmptyString" },
+        "issued_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "testHooks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["force_failure_after_mutation"],
+      "properties": {
+        "force_failure_after_mutation": { "type": "boolean" }
+      }
+    }
+  }
+}
