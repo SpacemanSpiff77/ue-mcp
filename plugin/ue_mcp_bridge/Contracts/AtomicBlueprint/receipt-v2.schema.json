@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "spacehead.blueprint-atomic-bridge.receipt@2.0",
+  "x-spacehead-schema-version": "spacehead.blueprint-atomic-bridge.receipt@2.0",
+  "title": "Spacehead bounded multi-operation Blueprint bridge receipt",
+  "type": "object", "additionalProperties": false,
+  "required": ["contract_version", "transaction_id", "correlation_id", "received_by_bridge", "state", "evidence"],
+  "properties": {
+    "contract_version": { "const": "spacehead.blueprint-atomic-bridge@2.0" },
+    "transaction_id": { "type": "string", "minLength": 1 }, "correlation_id": { "type": "string", "minLength": 1 },
+    "received_by_bridge": { "type": "boolean" }, "received_at": { "type": "string" },
+    "state": { "enum": ["FAILED_PRE_MUTATION", "QUARANTINED", "RESTORED", "SUCCESS", "UNKNOWN"] },
+    "evidence": { "$ref": "#/$defs/evidence" }, "failure": { "$ref": "#/$defs/failure" }
+  },
+  "$defs": {
+    "attempt": { "type": "object", "required": ["attempted", "succeeded"], "additionalProperties": true,
+      "properties": { "attempted": { "type": "boolean" }, "succeeded": { "type": "boolean" } } },
+    "operationResult": { "type": "object", "additionalProperties": true,
+      "required": ["operation_id", "operation_type", "succeeded", "mutation_occurred"],
+      "properties": { "operation_id": { "type": "string" }, "operation_type": { "type": "string" },
+        "succeeded": { "type": "boolean" }, "mutation_occurred": { "type": "boolean" },
+        "failure_code": { "type": "string" }, "resolved_identity": { "type": "object" } } },
+    "evidence": { "type": "object", "additionalProperties": true,
+      "properties": {
+        "dispatch_count": { "const": 1 }, "operation_count": { "type": "integer", "minimum": 1, "maximum": 8 },
+        "ordered_operation_ids": { "type": "array", "maxItems": 8, "items": { "type": "string" } },
+        "per_operation_results": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/operationResult" } },
+        "preflight": { "$ref": "#/$defs/attempt" }, "mutation": { "$ref": "#/$defs/attempt" },
+        "compile": { "$ref": "#/$defs/attempt" }, "verification": { "$ref": "#/$defs/attempt" },
+        "save": { "$ref": "#/$defs/attempt" }, "rollback": { "$ref": "#/$defs/attempt" },
+        "pre_semantic_fingerprint": { "type": "string" }, "post_semantic_fingerprint": { "type": "string" }
+      } },
+    "failure": { "type": "object", "additionalProperties": false,
+      "required": ["failure_version", "phase", "code", "retryable", "transaction_state", "message"],
+      "properties": {
+        "failure_version": { "const": "spacehead.builder-failure@1.0" }, "phase": { "type": "string" },
+        "code": { "type": "string" }, "retryable": { "const": false },
+        "transaction_state": { "enum": ["FAILED_PRE_MUTATION", "QUARANTINED", "RESTORED", "UNKNOWN"] },
+        "message": { "type": "string" }
+      } }
+  }
+}

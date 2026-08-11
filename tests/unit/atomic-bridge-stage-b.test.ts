@@ -6,9 +6,9 @@ const root = resolve(import.meta.dirname, "../..");
 const handler = readFileSync(resolve(root,
   "plugin/ue_mcp_bridge/Source/UE_MCP_Bridge/Private/Handlers/BlueprintHandlers_BuildSpec.cpp"), "utf8");
 const request = JSON.parse(readFileSync(resolve(root,
-  "plugin/ue_mcp_bridge/Contracts/AtomicBlueprint/request-v1.schema.json"), "utf8"));
+  "plugin/ue_mcp_bridge/Contracts/AtomicBlueprint/request-v2.schema.json"), "utf8"));
 const receipt = JSON.parse(readFileSync(resolve(root,
-  "plugin/ue_mcp_bridge/Contracts/AtomicBlueprint/receipt-v1.schema.json"), "utf8"));
+  "plugin/ue_mcp_bridge/Contracts/AtomicBlueprint/receipt-v2.schema.json"), "utf8"));
 
 describe("atomic Builder Stage B minimum graph vocabulary", () => {
   it("advertises each narrow capability through the existing atomic raw method", () => {
@@ -41,11 +41,9 @@ describe("atomic Builder Stage B minimum graph vocabulary", () => {
     for (const operation of ["graph.add-node@1.0", "graph.connect-pins@1.0", "graph.disconnect-pins@1.0", "graph.set-pin-default@1.0"])
       expect(encodedRequest).toContain(operation);
     expect(receipt.$defs.evidence.properties).toMatchObject({
-      operation_type: { type: "string" },
-      requested_identity: { type: "object" },
-      resolved_identity: { type: "object" },
-      intended_result: { type: "object" },
-      observed_result: { type: "object" },
+      operation_count: { type: "integer", minimum: 1, maximum: 8 },
+      ordered_operation_ids: { type: "array", maxItems: 8 },
+      per_operation_results: { type: "array", maxItems: 8 },
     });
   });
 });

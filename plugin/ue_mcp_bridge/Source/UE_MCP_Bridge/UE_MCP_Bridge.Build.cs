@@ -144,6 +144,8 @@ public class UE_MCP_Bridge : ModuleRules
 		{
 			"Contracts/AtomicBlueprint/receipt-v1.schema.json",
 			"Contracts/AtomicBlueprint/request-v1.schema.json",
+			"Contracts/AtomicBlueprint/request-v2.schema.json",
+			"Contracts/AtomicBlueprint/receipt-v2.schema.json",
 			"Source/UE_MCP_Bridge/Private/Handlers/BlueprintTopologySerializer.cpp",
 			"Source/UE_MCP_Bridge/Private/Handlers/BlueprintTopologySerializer.h",
 			"Source/UE_MCP_Bridge/Private/Handlers/BlueprintHandlers.cpp",

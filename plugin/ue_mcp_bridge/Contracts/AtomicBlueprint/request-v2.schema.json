@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "spacehead.blueprint-atomic-bridge.request@2.0",
+  "x-spacehead-schema-version": "spacehead.blueprint-atomic-bridge.request@2.0",
+  "title": "Spacehead bounded multi-operation Blueprint bridge request",
+  "oneOf": [
+    { "$ref": "#/$defs/readRequest" },
+    { "$ref": "#/$defs/statusRequest" },
+    { "$ref": "#/$defs/dispatchRequest" }
+  ],
+  "$defs": {
+    "contract": { "const": "spacehead.blueprint-atomic-bridge@2.0" },
+    "nonEmpty": { "type": "string", "minLength": 1 },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "readRequest": {
+      "type": "object", "additionalProperties": true,
+      "required": ["contract_version", "request_kind"],
+      "properties": {
+        "contract_version": { "$ref": "#/$defs/contract" },
+        "request_kind": { "enum": ["readiness", "discover", "canonical_vectors"] }
+      }
+    },
+    "statusRequest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract_version", "request_kind", "transaction_id", "correlation_id"],
+      "properties": {
+        "contract_version": { "$ref": "#/$defs/contract" },
+        "request_kind": { "const": "status" },
+        "transaction_id": { "$ref": "#/$defs/nonEmpty" },
+        "correlation_id": { "$ref": "#/$defs/nonEmpty" }
+      }
+    },
+    "nodeReference": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["kind", "node_guid"],
+          "properties": { "kind": { "const": "existing" }, "node_guid": { "$ref": "#/$defs/nonEmpty" } } },
+        { "type": "object", "additionalProperties": false, "required": ["kind", "logical_id"],
+          "properties": { "kind": { "const": "logical" }, "logical_id": { "$ref": "#/$defs/nonEmpty" } } }
+      ]
+    },
+    "pinReference": {
+      "type": "object", "additionalProperties": false,
+      "required": ["node", "pin_name", "direction"],
+      "properties": {
+        "node": { "$ref": "#/$defs/nodeReference" },
+        "pin_name": { "$ref": "#/$defs/nonEmpty" },
+        "direction": { "enum": ["input", "output"] }
+      }
+    },
+    "buildSpecOperation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["operation_id", "family", "kind", "operation_version", "depends_on", "payload"],
+      "properties": {
+        "operation_id": { "$ref": "#/$defs/nonEmpty" },
+        "family": { "const": "graph" },
+        "kind": { "enum": ["add_node", "set_pin_default", "connect_pins", "disconnect_pins"] },
+        "operation_version": { "enum": ["graph.add-node@1.0", "graph.set-pin-default@1.0", "graph.connect-pins@1.0", "graph.disconnect-pins@1.0"] },
+        "depends_on": { "type": "array", "maxItems": 7, "uniqueItems": true, "items": { "$ref": "#/$defs/nonEmpty" } },
+        "payload": { "type": "object" }
+      }
+    },
+    "buildSpec": {
+      "type": "object", "additionalProperties": false,
+      "required": ["spec_version", "request_id", "target", "operations", "policy"],
+      "properties": {
+        "spec_version": { "const": "spacehead.blueprint-build-spec@1.0" },
+        "request_id": { "$ref": "#/$defs/nonEmpty" },
+        "target": { "type": "object" },
+        "operations": { "type": "array", "minItems": 1, "maxItems": 8, "items": { "$ref": "#/$defs/buildSpecOperation" } },
+        "policy": { "type": "object" }
+      }
+    },
+    "buildPlanOperation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["operation_id", "semantic_capability_id", "capability_version", "operation_version", "depends_on", "existing_node_identities", "future_node_identities", "pin_expectations", "semantic_payload"],
+      "properties": {
+        "operation_id": { "$ref": "#/$defs/nonEmpty" },
+        "semantic_capability_id": { "enum": ["graph.add-node", "graph.set-pin-default", "graph.connect-pins", "graph.disconnect-pins"] },
+        "capability_version": { "const": "1.0" },
+        "operation_version": { "enum": ["graph.add-node@1.0", "graph.set-pin-default@1.0", "graph.connect-pins@1.0", "graph.disconnect-pins@1.0"] },
+        "depends_on": { "type": "array", "maxItems": 7, "uniqueItems": true, "items": { "$ref": "#/$defs/nonEmpty" } },
+        "target_graph_identity": { "type": "object" },
+        "existing_node_identities": { "type": "array", "maxItems": 2 },
+        "future_node_identities": { "type": "array", "maxItems": 2 },
+        "pin_expectations": { "type": "array", "maxItems": 2 },
+        "semantic_payload": { "type": "object" }
+      }
+    },
+    "buildPlan": {
+      "type": "object", "additionalProperties": false,
+      "required": ["plan_version", "build_spec_canonical_hash", "target", "scanner_baseline", "capability_qualification_digest", "operations", "expected_delta", "unchanged_invariants", "policies", "resource_budget", "bindings", "freshness_evidence", "build_plan_canonical_hash"],
+      "properties": {
+        "plan_version": { "const": "spacehead.blueprint-build-plan@1.0" },
+        "build_spec_canonical_hash": { "$ref": "#/$defs/sha256" },
+        "target": { "type": "object" },
+        "scanner_baseline": { "type": "object" },
+        "capability_qualification_digest": { "$ref": "#/$defs/sha256" },
+        "operations": { "type": "array", "minItems": 1, "maxItems": 8, "items": { "$ref": "#/$defs/buildPlanOperation" } },
+        "expected_delta": { "type": "object" },
+        "unchanged_invariants": { "type": "array", "items": { "type": "string" } },
+        "policies": { "type": "object" },
+        "resource_budget": { "type": "object" },
+        "bindings": { "type": "object" },
+        "freshness_evidence": { "type": "object" },
+        "build_plan_canonical_hash": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "fencing": {
+      "type": "object", "additionalProperties": false,
+      "required": ["target_identity", "fencing_token", "fencing_sequence", "lock_owner_request_id", "issued_at"],
+      "properties": {
+        "target_identity": { "$ref": "#/$defs/nonEmpty" }, "fencing_token": { "$ref": "#/$defs/nonEmpty" },
+        "fencing_sequence": { "type": "integer", "minimum": 1 }, "lock_owner_request_id": { "$ref": "#/$defs/nonEmpty" },
+        "issued_at": { "type": "string" }
+      }
+    },
+    "testHooks": {
+      "type": "object", "additionalProperties": false, "required": ["test_hook_version", "checkpoint"],
+      "properties": {
+        "test_hook_version": { "const": "spacehead.blueprint-atomic-bridge.test-hooks@2.0" },
+        "checkpoint": { "enum": ["BEFORE_PREFLIGHT", "AFTER_PREFLIGHT_BEFORE_MUTATION", "AFTER_MUTATION", "AFTER_FIRST_MUTATION", "AFTER_MIDDLE_MUTATION", "AFTER_FINAL_MUTATION", "BEFORE_COMPILE", "AFTER_COMPILE_BEFORE_VERIFY", "VERIFICATION_FAILURE", "AFTER_VERIFY_BEFORE_SAVE", "SAVE_FAILURE", "AFTER_SAVE_BEFORE_FINAL_RECEIPT", "ROLLBACK_FAILURE", "AFTER_ROLLBACK_BEFORE_FINAL_RECEIPT"] }
+      }
+    },
+    "dispatchRequest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract_version", "request_kind", "transaction_id", "correlation_id", "build_spec", "plan", "fencing"],
+      "properties": {
+        "contract_version": { "$ref": "#/$defs/contract" }, "request_kind": { "const": "dispatch" },
+        "transaction_id": { "$ref": "#/$defs/nonEmpty" }, "correlation_id": { "$ref": "#/$defs/nonEmpty" },
+        "build_spec": { "$ref": "#/$defs/buildSpec" }, "plan": { "$ref": "#/$defs/buildPlan" },
+        "fencing": { "$ref": "#/$defs/fencing" }, "test_hooks": { "$ref": "#/$defs/testHooks" }
+      }
+    }
+  }
+}
