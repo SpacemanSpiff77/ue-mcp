@@ -30,6 +30,9 @@
         "handler_version": { "type": "string" },
         "topology_version": { "type": "string" },
         "changed_pin_defaults": { "type": "integer", "minimum": 0, "maximum": 1 },
+        "changed_nodes": { "type": "integer", "minimum": 0, "maximum": 1 },
+        "changed_connections": { "type": "integer", "minimum": 0, "maximum": 1 },
+        "created_node_guid": { "type": "string" },
         "test_failure_injected": { "type": "boolean" },
         "fault_checkpoint": { "type": "string" },
         "errors": { "type": "integer", "minimum": 0 },
@@ -50,6 +53,11 @@
       "type": "object",
       "properties": {
         "dispatch_count": { "type": "integer", "minimum": 1, "maximum": 1 },
+        "operation_type": { "type": "string" },
+        "requested_identity": { "type": "object" },
+        "resolved_identity": { "type": "object" },
+        "intended_result": { "type": "object" },
+        "observed_result": { "type": "object" },
         "fault_checkpoint": { "type": "string" },
         "dirty_state": {
           "type": "object",

@@ -135,43 +135,79 @@
         }
       }
     },
-    "buildSpecOperation": {
+    "existingNodeReference": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["operation_id", "family", "kind", "operation_version", "depends_on", "payload"],
+      "required": ["kind", "node_guid"],
       "properties": {
-        "operation_id": { "$ref": "#/$defs/nonEmptyString" },
-        "family": { "const": "graph" },
-        "kind": { "const": "set_pin_default" },
-        "operation_version": { "const": "graph.set-pin-default@1.0" },
-        "depends_on": { "type": "array", "maxItems": 0 },
-        "payload": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["pin", "value"],
+        "kind": { "const": "existing" },
+        "node_guid": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "inputPinReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["node", "pin_name", "direction"],
+      "properties": {
+        "node": { "$ref": "#/$defs/existingNodeReference" },
+        "pin_name": { "$ref": "#/$defs/nonEmptyString" },
+        "direction": { "const": "input" }
+      }
+    },
+    "outputPinReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["node", "pin_name", "direction"],
+      "properties": {
+        "node": { "$ref": "#/$defs/existingNodeReference" },
+        "pin_name": { "$ref": "#/$defs/nonEmptyString" },
+        "direction": { "const": "output" }
+      }
+    },
+    "buildSpecOperation": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["operation_id", "family", "kind", "operation_version", "depends_on", "payload"],
           "properties": {
-            "pin": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["node", "pin_name", "direction"],
+            "operation_id": { "$ref": "#/$defs/nonEmptyString" }, "family": { "const": "graph" },
+            "kind": { "const": "set_pin_default" }, "operation_version": { "const": "graph.set-pin-default@1.0" },
+            "depends_on": { "type": "array", "maxItems": 0 },
+            "payload": { "type": "object", "additionalProperties": false, "required": ["pin", "value"],
+              "properties": { "pin": { "$ref": "#/$defs/inputPinReference" }, "value": { "type": "boolean" } } }
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["operation_id", "family", "kind", "operation_version", "depends_on", "payload"],
+          "properties": {
+            "operation_id": { "$ref": "#/$defs/nonEmptyString" }, "family": { "const": "graph" },
+            "kind": { "const": "add_node" }, "operation_version": { "const": "graph.add-node@1.0" },
+            "depends_on": { "type": "array", "maxItems": 0 },
+            "payload": { "type": "object", "additionalProperties": false,
+              "required": ["logical_id", "node_class", "semantic_type", "position"],
               "properties": {
-                "node": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "required": ["kind", "node_guid"],
-                  "properties": {
-                    "kind": { "const": "existing" },
-                    "node_guid": { "$ref": "#/$defs/nonEmptyString" }
-                  }
-                },
-                "pin_name": { "$ref": "#/$defs/nonEmptyString" },
-                "direction": { "const": "input" }
-              }
-            },
-            "value": { "type": "boolean" }
+                "logical_id": { "$ref": "#/$defs/nonEmptyString" }, "node_class": { "const": "K2Node_IfThenElse" },
+                "semantic_type": { "const": "branch" },
+                "position": { "type": "object", "additionalProperties": false, "required": ["x", "y"],
+                  "properties": { "x": { "type": "integer", "minimum": -1000000, "maximum": 1000000 },
+                    "y": { "type": "integer", "minimum": -1000000, "maximum": 1000000 } } }
+              } }
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["operation_id", "family", "kind", "operation_version", "depends_on", "payload"],
+          "properties": {
+            "operation_id": { "$ref": "#/$defs/nonEmptyString" }, "family": { "const": "graph" },
+            "kind": { "enum": ["connect_pins", "disconnect_pins"] },
+            "operation_version": { "enum": ["graph.connect-pins@1.0", "graph.disconnect-pins@1.0"] },
+            "depends_on": { "type": "array", "maxItems": 0 },
+            "payload": { "type": "object", "additionalProperties": false, "required": ["from", "to"],
+              "properties": { "from": { "$ref": "#/$defs/outputPinReference" }, "to": { "$ref": "#/$defs/inputPinReference" } } }
           }
         }
-      }
+      ]
     },
     "buildPlan": {
       "type": "object",
@@ -200,28 +236,47 @@
     },
     "buildPlanOperation": {
       "type": "object",
+      "additionalProperties": false,
       "required": ["operation_id", "semantic_capability_id", "capability_version", "operation_version", "depends_on", "existing_node_identities", "future_node_identities", "pin_expectations", "semantic_payload"],
       "properties": {
         "operation_id": { "$ref": "#/$defs/nonEmptyString" },
-        "semantic_capability_id": { "const": "graph.set-pin-default" },
+        "semantic_capability_id": { "enum": ["graph.set-pin-default", "graph.add-node", "graph.connect-pins", "graph.disconnect-pins"] },
         "capability_version": { "const": "1.0" },
-        "operation_version": { "const": "graph.set-pin-default@1.0" },
+        "operation_version": { "enum": ["graph.set-pin-default@1.0", "graph.add-node@1.0", "graph.connect-pins@1.0", "graph.disconnect-pins@1.0"] },
         "depends_on": { "type": "array", "maxItems": 0 },
-        "existing_node_identities": { "type": "array", "minItems": 1, "maxItems": 1 },
-        "future_node_identities": { "type": "array", "maxItems": 0 },
-        "pin_expectations": { "type": "array", "minItems": 1, "maxItems": 1 },
+        "target_graph_identity": { "type": "object" },
+        "existing_node_identities": { "type": "array", "maxItems": 2 },
+        "future_node_identities": { "type": "array", "maxItems": 1 },
+        "pin_expectations": { "type": "array", "maxItems": 2 },
         "semantic_payload": {
           "type": "object",
-          "required": ["node_guid", "pin_id", "pin_name", "expected_current_value", "desired_value", "baseline_semantic_topology", "baseline_semantic_fingerprint"],
+          "required": ["baseline_semantic_topology", "baseline_semantic_fingerprint"],
           "properties": {
             "node_guid": { "$ref": "#/$defs/nonEmptyString" },
             "pin_id": { "$ref": "#/$defs/nonEmptyString" },
             "pin_name": { "$ref": "#/$defs/nonEmptyString" },
             "expected_current_value": { "type": "boolean" },
             "desired_value": { "type": "boolean" },
+            "logical_id": { "$ref": "#/$defs/nonEmptyString" },
+            "node_class": { "type": "string" },
+            "semantic_type": { "type": "string" },
+            "created_node_guid": { "$ref": "#/$defs/nonEmptyString" },
+            "position": { "type": "object" },
+            "from_node_guid": { "$ref": "#/$defs/nonEmptyString" },
+            "from_node_id": { "$ref": "#/$defs/nonEmptyString" },
+            "from_pin_id": { "$ref": "#/$defs/nonEmptyString" },
+            "from_pin_name": { "$ref": "#/$defs/nonEmptyString" },
+            "to_node_guid": { "$ref": "#/$defs/nonEmptyString" },
+            "to_node_id": { "$ref": "#/$defs/nonEmptyString" },
+            "to_pin_id": { "$ref": "#/$defs/nonEmptyString" },
+            "to_pin_name": { "$ref": "#/$defs/nonEmptyString" },
+            "classification": { "enum": ["execution", "data"] },
+            "graph_name": { "type": "string" },
+            "graph_kind": { "enum": ["graph", "function"] },
             "baseline_semantic_topology": { "$ref": "#/$defs/semanticTopology" },
             "baseline_semantic_fingerprint": { "$ref": "#/$defs/sha256" }
-          }
+          },
+          "additionalProperties": false
         }
       }
     },

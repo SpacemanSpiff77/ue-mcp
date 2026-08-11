@@ -15,7 +15,9 @@
 #include "HAL/PlatformFileManager.h"
 #include "Interfaces/IPluginManager.h"
 #include "Kismet2/CompilerResultsLog.h"
+#include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
+#include "K2Node_IfThenElse.h"
 #include "Misc/EngineVersion.h"
 #include "Misc/App.h"
 #include "Misc/FileHelper.h"
@@ -31,6 +33,9 @@ namespace
 	const TCHAR* EndpointIdentity = TEXT("blueprint.apply-atomic-build-plan@1.0");
 	const TCHAR* RawMethodIdentity = TEXT("apply_atomic_build_plan");
 	const TCHAR* SemanticCapability = TEXT("graph.set-pin-default");
+	const TCHAR* AddNodeCapability = TEXT("graph.add-node");
+	const TCHAR* ConnectPinsCapability = TEXT("graph.connect-pins");
+	const TCHAR* DisconnectPinsCapability = TEXT("graph.disconnect-pins");
 	const TCHAR* CapabilityVersion = TEXT("1.0");
 	const TCHAR* OperationVersion = TEXT("graph.set-pin-default@1.0");
 	const TCHAR* HandlerVersion = TEXT("spacehead.graph.set-pin-default-handler@1.0");
@@ -505,12 +510,16 @@ namespace
 		return Match;
 	}
 
-	UEdGraphPin* ResolvePin(UEdGraphNode* Node, const FString& PinId, const FString& PinName)
+	UEdGraphPin* ResolvePin(
+		UEdGraphNode* Node,
+		const FString& PinId,
+		const FString& PinName,
+		EEdGraphPinDirection Direction = EGPD_Input)
 	{
 		UEdGraphPin* Match = nullptr;
 		for (UEdGraphPin* Pin : Node->Pins)
 		{
-			if (!Pin || Pin->Direction != EGPD_Input
+			if (!Pin || Pin->Direction != Direction
 				|| NormalizeGuid(Pin->PinId.ToString(EGuidFormats::Digits)) != NormalizeGuid(PinId)
 				|| Pin->PinName.ToString() != PinName) continue;
 			if (Match) return nullptr;
@@ -745,27 +754,36 @@ namespace
 		Result->SetStringField(TEXT("plugin_build_identity"), UE_MCP_AtomicBuildIdentity::PluginBuildIdentity);
 		Result->SetStringField(TEXT("discovered_at"), FDateTime::UtcNow().ToIso8601());
 		Result->SetBoolField(TEXT("qualified"), false);
-		TSharedPtr<FJsonObject> Capability = MakeShared<FJsonObject>();
-		Capability->SetStringField(TEXT("semantic_capability_id"), SemanticCapability);
-		Capability->SetStringField(TEXT("capability_version"), CapabilityVersion);
-		Capability->SetStringField(TEXT("toolset_identity"), TEXT("blueprint"));
-		Capability->SetStringField(TEXT("toolset_version"), UeMcpVersion);
-		Capability->SetStringField(TEXT("tool_identity"), TEXT("blueprint"));
-		Capability->SetStringField(TEXT("action_identity"), RawMethodIdentity);
-		Capability->SetStringField(TEXT("raw_method_identity"), RawMethodIdentity);
-		if (bInputSchemaAvailable)
+		auto CapabilityJson = [&](const TCHAR* SemanticId)
 		{
-			Capability->SetStringField(TEXT("input_schema_version"), InputSchemaVersion);
-			Capability->SetStringField(TEXT("input_schema_digest"), InputDigest);
-		}
-		if (bOutputSchemaAvailable)
-		{
-			Capability->SetStringField(TEXT("output_schema_version"), OutputSchemaVersion);
-			Capability->SetStringField(TEXT("output_schema_digest"), OutputDigest);
-		}
-		Capability->SetBoolField(TEXT("enabled"), true);
-		Capability->SetBoolField(TEXT("available"), bBuildIdentityAvailable && bInputSchemaAvailable && bOutputSchemaAvailable);
-		Result->SetArrayField(TEXT("capabilities"), { MakeShared<FJsonValueObject>(Capability) });
+			TSharedPtr<FJsonObject> Capability = MakeShared<FJsonObject>();
+			Capability->SetStringField(TEXT("semantic_capability_id"), SemanticId);
+			Capability->SetStringField(TEXT("capability_version"), CapabilityVersion);
+			Capability->SetStringField(TEXT("toolset_identity"), TEXT("blueprint"));
+			Capability->SetStringField(TEXT("toolset_version"), UeMcpVersion);
+			Capability->SetStringField(TEXT("tool_identity"), TEXT("blueprint"));
+			Capability->SetStringField(TEXT("action_identity"), RawMethodIdentity);
+			Capability->SetStringField(TEXT("raw_method_identity"), RawMethodIdentity);
+			if (bInputSchemaAvailable)
+			{
+				Capability->SetStringField(TEXT("input_schema_version"), InputSchemaVersion);
+				Capability->SetStringField(TEXT("input_schema_digest"), InputDigest);
+			}
+			if (bOutputSchemaAvailable)
+			{
+				Capability->SetStringField(TEXT("output_schema_version"), OutputSchemaVersion);
+				Capability->SetStringField(TEXT("output_schema_digest"), OutputDigest);
+			}
+			Capability->SetBoolField(TEXT("enabled"), true);
+			Capability->SetBoolField(TEXT("available"), bBuildIdentityAvailable && bInputSchemaAvailable && bOutputSchemaAvailable);
+			return MakeShared<FJsonValueObject>(Capability);
+		};
+		Result->SetArrayField(TEXT("capabilities"), {
+			CapabilityJson(SemanticCapability),
+			CapabilityJson(AddNodeCapability),
+			CapabilityJson(ConnectPinsCapability),
+			CapabilityJson(DisconnectPinsCapability),
+		});
 		return Result;
 	}
 
@@ -932,6 +950,590 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 	const TArray<TSharedPtr<FJsonValue>>* Operations = ArrayField(Plan, TEXT("operations"));
 	const TSharedPtr<FJsonObject> Operation = Operations && Operations->Num() == 1 ? (*Operations)[0]->AsObject() : nullptr;
 	const TSharedPtr<FJsonObject> Payload = ObjectField(Operation, TEXT("semantic_payload"));
+	FString CandidateOperationVersion;
+	if (Operation.IsValid()
+		&& Operation->TryGetStringField(TEXT("operation_version"), CandidateOperationVersion)
+		&& CandidateOperationVersion != OperationVersion)
+	{
+		enum class EStageBOperation { AddNode, ConnectPins, DisconnectPins };
+		EStageBOperation StageBOperation;
+		const TCHAR* ExpectedCapability = nullptr;
+		const TCHAR* ExpectedSpecKind = nullptr;
+		const TCHAR* ExpectedHandler = nullptr;
+		if (CandidateOperationVersion == TEXT("graph.add-node@1.0"))
+		{
+			StageBOperation = EStageBOperation::AddNode;
+			ExpectedCapability = AddNodeCapability;
+			ExpectedSpecKind = TEXT("add_node");
+			ExpectedHandler = TEXT("spacehead.graph.add-node-handler@1.0");
+		}
+		else if (CandidateOperationVersion == TEXT("graph.connect-pins@1.0"))
+		{
+			StageBOperation = EStageBOperation::ConnectPins;
+			ExpectedCapability = ConnectPinsCapability;
+			ExpectedSpecKind = TEXT("connect_pins");
+			ExpectedHandler = TEXT("spacehead.graph.connect-pins-handler@1.0");
+		}
+		else if (CandidateOperationVersion == TEXT("graph.disconnect-pins@1.0"))
+		{
+			StageBOperation = EStageBOperation::DisconnectPins;
+			ExpectedCapability = DisconnectPinsCapability;
+			ExpectedSpecKind = TEXT("disconnect_pins");
+			ExpectedHandler = TEXT("spacehead.graph.disconnect-pins-handler@1.0");
+		}
+		else
+		{
+			SetFailure(Receipt, TEXT("SPEC"), TEXT("UNQUALIFIED_ATOMIC_PLAN"), TEXT("FAILED_PRE_MUTATION"),
+				TEXT("The graph operation is outside the qualified Stage B vocabulary"));
+			return Complete(Receipt);
+		}
+
+		const TSharedPtr<FJsonObject> SpecTarget = ObjectField(BuildSpec, TEXT("target"));
+		const TArray<TSharedPtr<FJsonValue>>* SpecOperations = ArrayField(BuildSpec, TEXT("operations"));
+		const TSharedPtr<FJsonObject> SpecOperation = SpecOperations && SpecOperations->Num() == 1
+			? (*SpecOperations)[0]->AsObject() : nullptr;
+		const TSharedPtr<FJsonObject> SpecPayload = ObjectField(SpecOperation, TEXT("payload"));
+		const TSharedPtr<FJsonObject> SpecPolicy = ObjectField(BuildSpec, TEXT("policy"));
+		FString PackagePath;
+		FString BlueprintName;
+		FString Capability;
+		FString HandlerIdentity;
+		FString SelectorKind;
+		FString SelectorName;
+		FString OperationId;
+		FString SpecVersion;
+		FString SpecRequestId;
+		FString SpecOperationId;
+		FString SpecFamily;
+		FString SpecKind;
+		FString SpecOperationVersion;
+		FString Atomicity;
+		bool bCompileWithoutSave = false;
+		bool bSaveAfterVerification = false;
+		bool bRollbackOnFailure = false;
+		if (!Target.IsValid() || !Selectors || Selectors->Num() != 1 || !Operation.IsValid() || !Payload.IsValid()
+			|| !SpecTarget.IsValid() || !SpecOperation.IsValid() || !SpecPayload.IsValid() || !SpecPolicy.IsValid()
+			|| CanonicalJsonObject(SpecTarget) != CanonicalJsonObject(Target)
+			|| !Target->TryGetStringField(TEXT("package_path"), PackagePath)
+			|| !Target->TryGetStringField(TEXT("blueprint_name"), BlueprintName)
+			|| !PackagePath.StartsWith(TEXT("/Game/Tests/Builder/"))
+			|| PackagePath != TEXT("/Game/Tests/Builder/") + BlueprintName
+			|| !Operation->TryGetStringField(TEXT("semantic_capability_id"), Capability) || Capability != ExpectedCapability
+			|| !Operation->TryGetStringField(TEXT("operation_id"), OperationId) || OperationId.IsEmpty()
+			|| !(*Selectors)[0]->AsObject()->TryGetStringField(TEXT("kind"), SelectorKind)
+			|| !(*Selectors)[0]->AsObject()->TryGetStringField(TEXT("name"), SelectorName)
+			|| !BuildSpec->TryGetStringField(TEXT("spec_version"), SpecVersion)
+			|| SpecVersion != TEXT("spacehead.blueprint-build-spec@1.0")
+			|| !BuildSpec->TryGetStringField(TEXT("request_id"), SpecRequestId) || SpecRequestId.IsEmpty()
+			|| !SpecOperation->TryGetStringField(TEXT("operation_id"), SpecOperationId) || SpecOperationId != OperationId
+			|| !SpecOperation->TryGetStringField(TEXT("family"), SpecFamily) || SpecFamily != TEXT("graph")
+			|| !SpecOperation->TryGetStringField(TEXT("kind"), SpecKind) || SpecKind != ExpectedSpecKind
+			|| !SpecOperation->TryGetStringField(TEXT("operation_version"), SpecOperationVersion)
+			|| SpecOperationVersion != CandidateOperationVersion
+			|| !SpecPolicy->TryGetStringField(TEXT("atomicity"), Atomicity) || Atomicity != TEXT("ONE_BLUEPRINT_PACKAGE")
+			|| !SpecPolicy->TryGetBoolField(TEXT("compile_without_save"), bCompileWithoutSave) || !bCompileWithoutSave
+			|| !SpecPolicy->TryGetBoolField(TEXT("save_after_verification_only"), bSaveAfterVerification) || !bSaveAfterVerification
+			|| !SpecPolicy->TryGetBoolField(TEXT("rollback_on_failure"), bRollbackOnFailure) || !bRollbackOnFailure)
+		{
+			SetFailure(Receipt, TEXT("SPEC"), TEXT("BUILD_SPEC_PLAN_MISMATCH"), TEXT("FAILED_PRE_MUTATION"),
+				TEXT("Canonical Stage B BuildSpec semantics do not exactly match the executable BuildPlan"));
+			return Complete(Receipt);
+		}
+
+		const TSharedPtr<FJsonObject> BaselineTopology = ObjectField(Payload, TEXT("baseline_semantic_topology"));
+		FString BaselineSemanticHash;
+		if (!BaselineTopology.IsValid()
+			|| !Payload->TryGetStringField(TEXT("baseline_semantic_fingerprint"), BaselineSemanticHash)
+			|| !ValidHash(BaselineSemanticHash)
+			|| Sha256(CanonicalJsonObject(BaselineTopology)) != BaselineSemanticHash)
+		{
+			SetFailure(Receipt, TEXT("BASELINE"), TEXT("INVALID_SEMANTIC_BASELINE"), TEXT("FAILED_PRE_MUTATION"),
+				TEXT("Canonical semantic baseline integrity failed"));
+			return Complete(Receipt);
+		}
+
+		FString TargetIdentity;
+		FString FencingToken;
+		FString LockOwner;
+		double FencingSequenceNumber = 0;
+		const FString ExpectedTargetIdentity = PackagePath + TEXT(":") + BlueprintName;
+		if (!Fencing->TryGetStringField(TEXT("target_identity"), TargetIdentity)
+			|| TargetIdentity != ExpectedTargetIdentity
+			|| !Fencing->TryGetStringField(TEXT("fencing_token"), FencingToken)
+			|| !Fencing->TryGetStringField(TEXT("lock_owner_request_id"), LockOwner) || LockOwner != SpecRequestId
+			|| !Fencing->TryGetNumberField(TEXT("fencing_sequence"), FencingSequenceNumber)
+			|| FencingSequenceNumber < 1 || FMath::FloorToDouble(FencingSequenceNumber) != FencingSequenceNumber
+			|| !AcceptFencing(TargetIdentity, TransactionId, FencingToken, static_cast<int64>(FencingSequenceNumber)))
+		{
+			SetFailure(Receipt, TEXT("CONCURRENCY"), TEXT("STALE_OR_INVALID_FENCING"), TEXT("FAILED_PRE_MUTATION"),
+				TEXT("Bridge fencing validation failed closed"));
+			return Complete(Receipt);
+		}
+
+		FString FaultCheckpoint;
+		if (!ReadTestFaultCheckpoint(TestHooks, PackagePath, FaultCheckpoint))
+		{
+			SetFailure(Receipt, TEXT("SPEC"), TEXT("TEST_HOOKS_NOT_AUTHORIZED"), TEXT("FAILED_PRE_MUTATION"),
+				TEXT("Fault injection requires the versioned disposable ue_mcp test-project gate"));
+			return Complete(Receipt);
+		}
+		TSharedPtr<FJsonObject> Evidence = ObjectField(Receipt, TEXT("evidence"));
+		Evidence->SetNumberField(TEXT("dispatch_count"), 1);
+		Evidence->SetStringField(TEXT("operation_type"), CandidateOperationVersion);
+		Evidence->SetObjectField(TEXT("requested_identity"), CloneObject(SpecPayload));
+		if (!FaultCheckpoint.IsEmpty()) Evidence->SetStringField(TEXT("fault_checkpoint"), FaultCheckpoint);
+		TSharedPtr<FJsonObject> Received = CloneObject(Receipt);
+		Received->SetStringField(TEXT("state"), TEXT("UNKNOWN"));
+		SetFailure(Received, TEXT("TRANSPORT_UNKNOWN"), TEXT("EXECUTION_IN_PROGRESS_OR_INTERRUPTED"), TEXT("UNKNOWN"),
+			TEXT("The bridge durably received the transaction but no terminal outcome is yet recorded"));
+		if (!PersistDurableExecution(TransactionId, CorrelationId, PlanHash, Fencing, Received))
+		{
+			SetFailure(Receipt, TEXT("INTERNAL_CONTRACT"), TEXT("DURABLE_RECEIPT_NOT_ESTABLISHED"), TEXT("QUARANTINED"),
+				TEXT("Mutation was denied because durable correlated evidence could not be established"));
+			return Complete(Receipt);
+		}
+		if (FaultCheckpoint == TEXT("BEFORE_PREFLIGHT"))
+		{
+			TSharedPtr<FJsonObject> PreflightEvidence = Attempt(false, false);
+			PreflightEvidence->SetBoolField(TEXT("test_failure_injected"), true);
+			PreflightEvidence->SetStringField(TEXT("fault_checkpoint"), FaultCheckpoint);
+			Evidence->SetObjectField(TEXT("preflight"), PreflightEvidence);
+			SetFailure(Receipt, TEXT("LIVE_PREFLIGHT"), TEXT("FORCED_BEFORE_PREFLIGHT"), TEXT("FAILED_PRE_MUTATION"),
+				TEXT("Test-only failure injected before live preflight"));
+			return Complete(Receipt);
+		}
+
+		UBlueprint* Blueprint = LoadBlueprint(PackagePath);
+		UEdGraph* Graph = Blueprint ? ResolveTargetGraph(Blueprint, SelectorKind, SelectorName) : nullptr;
+		UPackage* Package = Blueprint ? Blueprint->GetOutermost() : nullptr;
+		const UEdGraphSchema* Schema = Graph ? Graph->GetSchema() : nullptr;
+		const bool bDirtyBefore = Package && Package->IsDirty();
+		bool bPreComplete = false;
+		const FString GraphType = BaselineTopology->GetObjectField(TEXT("graph"))->GetStringField(TEXT("graph_type"));
+		TSharedPtr<FJsonObject> PreTopology = Graph ? SemanticTopology(Graph, GraphType, bPreComplete) : nullptr;
+		const bool bDirtyAfterPreflight = Package && Package->IsDirty();
+
+		FString CreatedNodeGuid;
+		FString LogicalId;
+		FString NodeClass;
+		FString SemanticType;
+		double PositionX = 0;
+		double PositionY = 0;
+		FGuid ParsedCreatedGuid;
+		FString FromNodeGuid;
+		FString FromNodeId;
+		FString FromPinId;
+		FString FromPinName;
+		FString ToNodeGuid;
+		FString ToNodeId;
+		FString ToPinId;
+		FString ToPinName;
+		UEdGraphNode* FromNode = nullptr;
+		UEdGraphNode* ToNode = nullptr;
+		UEdGraphPin* FromPin = nullptr;
+		UEdGraphPin* ToPin = nullptr;
+		UEdGraphNode* AddedNode = nullptr;
+		TSharedPtr<FJsonObject> ExpectedPost = CloneObject(BaselineTopology);
+		bool bOperationPreflight = false;
+
+		if (StageBOperation == EStageBOperation::AddNode)
+		{
+			const TSharedPtr<FJsonObject> Position = ObjectField(Payload, TEXT("position"));
+			const TSharedPtr<FJsonObject> SpecPosition = ObjectField(SpecPayload, TEXT("position"));
+			FString SpecLogicalId;
+			FString SpecNodeClass;
+			FString SpecSemanticType;
+			double SpecX = 0;
+			double SpecY = 0;
+			bOperationPreflight = Position.IsValid() && SpecPosition.IsValid()
+				&& Payload->TryGetStringField(TEXT("logical_id"), LogicalId)
+				&& Payload->TryGetStringField(TEXT("node_class"), NodeClass) && NodeClass == TEXT("K2Node_IfThenElse")
+				&& Payload->TryGetStringField(TEXT("semantic_type"), SemanticType) && SemanticType == TEXT("branch")
+				&& Payload->TryGetStringField(TEXT("created_node_guid"), CreatedNodeGuid)
+				&& FGuid::Parse(CreatedNodeGuid, ParsedCreatedGuid) && ParsedCreatedGuid.IsValid()
+				&& Position->TryGetNumberField(TEXT("x"), PositionX) && Position->TryGetNumberField(TEXT("y"), PositionY)
+				&& FMath::FloorToDouble(PositionX) == PositionX && FMath::Abs(PositionX) <= 1000000
+				&& FMath::FloorToDouble(PositionY) == PositionY && FMath::Abs(PositionY) <= 1000000
+				&& SpecPayload->TryGetStringField(TEXT("logical_id"), SpecLogicalId) && SpecLogicalId == LogicalId
+				&& SpecPayload->TryGetStringField(TEXT("node_class"), SpecNodeClass) && SpecNodeClass == NodeClass
+				&& SpecPayload->TryGetStringField(TEXT("semantic_type"), SpecSemanticType) && SpecSemanticType == SemanticType
+				&& SpecPosition->TryGetNumberField(TEXT("x"), SpecX) && SpecX == PositionX
+				&& SpecPosition->TryGetNumberField(TEXT("y"), SpecY) && SpecY == PositionY
+				&& Graph && !ResolveNode(Graph, CreatedNodeGuid) && Cast<UEdGraphSchema_K2>(Schema);
+		}
+		else
+		{
+			const TSharedPtr<FJsonObject> SpecFrom = ObjectField(SpecPayload, TEXT("from"));
+			const TSharedPtr<FJsonObject> SpecTo = ObjectField(SpecPayload, TEXT("to"));
+			const TSharedPtr<FJsonObject> SpecFromNode = ObjectField(SpecFrom, TEXT("node"));
+			const TSharedPtr<FJsonObject> SpecToNode = ObjectField(SpecTo, TEXT("node"));
+			FString SpecFromKind;
+			FString SpecFromGuid;
+			FString SpecFromName;
+			FString SpecFromDirection;
+			FString SpecToKind;
+			FString SpecToGuid;
+			FString SpecToName;
+			FString SpecToDirection;
+			FString Classification;
+			const bool bPayloadValid = Payload->TryGetStringField(TEXT("from_node_guid"), FromNodeGuid)
+				&& Payload->TryGetStringField(TEXT("from_node_id"), FromNodeId)
+				&& Payload->TryGetStringField(TEXT("from_pin_id"), FromPinId)
+				&& Payload->TryGetStringField(TEXT("from_pin_name"), FromPinName)
+				&& Payload->TryGetStringField(TEXT("to_node_guid"), ToNodeGuid)
+				&& Payload->TryGetStringField(TEXT("to_node_id"), ToNodeId)
+				&& Payload->TryGetStringField(TEXT("to_pin_id"), ToPinId)
+				&& Payload->TryGetStringField(TEXT("to_pin_name"), ToPinName)
+				&& Payload->TryGetStringField(TEXT("classification"), Classification) && Classification == TEXT("execution")
+				&& SpecFrom.IsValid() && SpecTo.IsValid() && SpecFromNode.IsValid() && SpecToNode.IsValid()
+				&& SpecFromNode->TryGetStringField(TEXT("kind"), SpecFromKind) && SpecFromKind == TEXT("existing")
+				&& SpecFromNode->TryGetStringField(TEXT("node_guid"), SpecFromGuid)
+				&& NormalizeGuid(SpecFromGuid) == NormalizeGuid(FromNodeGuid)
+				&& SpecFrom->TryGetStringField(TEXT("pin_name"), SpecFromName) && SpecFromName == FromPinName
+				&& SpecFrom->TryGetStringField(TEXT("direction"), SpecFromDirection) && SpecFromDirection == TEXT("output")
+				&& SpecToNode->TryGetStringField(TEXT("kind"), SpecToKind) && SpecToKind == TEXT("existing")
+				&& SpecToNode->TryGetStringField(TEXT("node_guid"), SpecToGuid)
+				&& NormalizeGuid(SpecToGuid) == NormalizeGuid(ToNodeGuid)
+				&& SpecTo->TryGetStringField(TEXT("pin_name"), SpecToName) && SpecToName == ToPinName
+				&& SpecTo->TryGetStringField(TEXT("direction"), SpecToDirection) && SpecToDirection == TEXT("input");
+			FromNode = Graph ? ResolveNode(Graph, FromNodeGuid) : nullptr;
+			ToNode = Graph ? ResolveNode(Graph, ToNodeGuid) : nullptr;
+			FromPin = FromNode ? ResolvePin(FromNode, FromPinId, FromPinName, EGPD_Output) : nullptr;
+			ToPin = ToNode ? ResolvePin(ToNode, ToPinId, ToPinName, EGPD_Input) : nullptr;
+			const bool bExactExecutionPins = FromPin && ToPin && FromNode != ToNode
+				&& FromPin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec
+				&& ToPin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec
+				&& FromPin->PinType.ContainerType == EPinContainerType::None
+				&& ToPin->PinType.ContainerType == EPinContainerType::None
+				&& Cast<UEdGraphSchema_K2>(Schema);
+			const bool bLinked = bExactExecutionPins && FromPin->LinkedTo.Contains(ToPin) && ToPin->LinkedTo.Contains(FromPin);
+			if (StageBOperation == EStageBOperation::ConnectPins)
+			{
+				const FPinConnectionResponse Response = bExactExecutionPins
+					? Schema->CanCreateConnection(FromPin, ToPin)
+					: FPinConnectionResponse(CONNECT_RESPONSE_DISALLOW, FText::GetEmpty());
+				bOperationPreflight = bPayloadValid && bExactExecutionPins && !bLinked
+					&& FromPin->LinkedTo.IsEmpty() && ToPin->LinkedTo.IsEmpty()
+					&& Response.Response == CONNECT_RESPONSE_MAKE;
+			}
+			else
+			{
+				bOperationPreflight = bPayloadValid && bExactExecutionPins && bLinked;
+			}
+
+			const TSharedPtr<FJsonObject> ExpectedConnection = MakeShared<FJsonObject>();
+			ExpectedConnection->SetStringField(TEXT("from_node_id"), FromNodeId);
+			ExpectedConnection->SetStringField(TEXT("from_pin_id"), FromPinId);
+			ExpectedConnection->SetStringField(TEXT("to_node_id"), ToNodeId);
+			ExpectedConnection->SetStringField(TEXT("to_pin_id"), ToPinId);
+			ExpectedConnection->SetStringField(TEXT("classification"), TEXT("execution"));
+			const TArray<TSharedPtr<FJsonValue>>* BaselineConnections = ArrayField(ExpectedPost, TEXT("connections"));
+			TArray<TSharedPtr<FJsonValue>> UpdatedConnections = BaselineConnections ? *BaselineConnections : TArray<TSharedPtr<FJsonValue>>();
+			if (StageBOperation == EStageBOperation::ConnectPins)
+			{
+				UpdatedConnections.Add(MakeShared<FJsonValueObject>(ExpectedConnection));
+			}
+			else
+			{
+				UpdatedConnections.RemoveAll([&](const TSharedPtr<FJsonValue>& Value)
+				{
+					return CanonicalJsonObject(Value->AsObject()) == CanonicalJsonObject(ExpectedConnection);
+				});
+			}
+			UpdatedConnections.Sort([](const TSharedPtr<FJsonValue>& A, const TSharedPtr<FJsonValue>& B)
+			{
+				return CanonicalJsonObject(A->AsObject()) < CanonicalJsonObject(B->AsObject());
+			});
+			ExpectedPost->SetArrayField(TEXT("connections"), UpdatedConnections);
+		}
+
+		const bool bPreflightSucceeded = Blueprint && Graph && Package && Schema && bPreComplete
+			&& !bDirtyBefore && !bDirtyAfterPreflight && bOperationPreflight
+			&& CanonicalJsonObject(PreTopology) == CanonicalJsonObject(BaselineTopology);
+		TSharedPtr<FJsonObject> DirtyState = MakeShared<FJsonObject>();
+		DirtyState->SetBoolField(TEXT("before"), bDirtyBefore);
+		DirtyState->SetBoolField(TEXT("after_preflight"), bDirtyAfterPreflight);
+		Evidence->SetObjectField(TEXT("dirty_state"), DirtyState);
+		TSharedPtr<FJsonObject> PreflightEvidence = Attempt(true, bPreflightSucceeded);
+		PreflightEvidence->SetBoolField(TEXT("target_resolved"), Blueprint && Graph && Package && bOperationPreflight);
+		PreflightEvidence->SetBoolField(TEXT("semantic_baseline_exact"), bPreflightSucceeded);
+		PreflightEvidence->SetStringField(TEXT("handler_version"), ExpectedHandler);
+		PreflightEvidence->SetStringField(TEXT("topology_version"), TopologyVersion);
+		Evidence->SetObjectField(TEXT("preflight"), PreflightEvidence);
+		Evidence->SetStringField(TEXT("pre_semantic_fingerprint"), bPreComplete ? Sha256(CanonicalJsonObject(PreTopology)) : FString());
+		if (!bPreflightSucceeded)
+		{
+			SetFailure(Receipt, TEXT("LIVE_PREFLIGHT"), TEXT("STALE_PLAN_OR_UNSUPPORTED_GRAPH_BEHAVIOR"), TEXT("FAILED_PRE_MUTATION"),
+				TEXT("Live Unreal preflight did not exactly match the Stage B plan or safe schema behavior"));
+			return Complete(Receipt);
+		}
+		if (FaultCheckpoint == TEXT("AFTER_PREFLIGHT_BEFORE_MUTATION"))
+		{
+			PreflightEvidence->SetBoolField(TEXT("test_failure_injected"), true);
+			PreflightEvidence->SetStringField(TEXT("fault_checkpoint"), FaultCheckpoint);
+			SetFailure(Receipt, TEXT("LIVE_PREFLIGHT"), TEXT("FORCED_AFTER_PREFLIGHT"), TEXT("FAILED_PRE_MUTATION"),
+				TEXT("Test-only failure injected after live preflight and before mutation"));
+			return Complete(Receipt);
+		}
+
+		TSharedPtr<FJsonObject> ResolvedIdentity = MakeShared<FJsonObject>();
+		if (StageBOperation == EStageBOperation::AddNode)
+		{
+			ResolvedIdentity->SetStringField(TEXT("created_node_guid"), CreatedNodeGuid);
+			ResolvedIdentity->SetStringField(TEXT("node_class"), NodeClass);
+			ResolvedIdentity->SetStringField(TEXT("semantic_type"), SemanticType);
+		}
+		else
+		{
+			ResolvedIdentity->SetStringField(TEXT("from_node_guid"), FromNodeGuid);
+			ResolvedIdentity->SetStringField(TEXT("from_pin_id"), FromPinId);
+			ResolvedIdentity->SetStringField(TEXT("to_node_guid"), ToNodeGuid);
+			ResolvedIdentity->SetStringField(TEXT("to_pin_id"), ToPinId);
+		}
+		Evidence->SetObjectField(TEXT("resolved_identity"), ResolvedIdentity);
+		TSharedPtr<FJsonObject> IntendedResult = MakeShared<FJsonObject>();
+		IntendedResult->SetStringField(TEXT("operation"), ExpectedSpecKind);
+		IntendedResult->SetStringField(TEXT("baseline_fingerprint"), BaselineSemanticHash);
+		Evidence->SetObjectField(TEXT("intended_result"), IntendedResult);
+
+		auto VerifyAddedNode = [&](const TSharedPtr<FJsonObject>& Topology) -> bool
+		{
+			if (!Topology.IsValid()) return false;
+			const TArray<TSharedPtr<FJsonValue>>* PostNodes = ArrayField(Topology, TEXT("nodes"));
+			const TArray<TSharedPtr<FJsonValue>>* BaselineNodes = ArrayField(BaselineTopology, TEXT("nodes"));
+			if (!PostNodes || !BaselineNodes || PostNodes->Num() != BaselineNodes->Num() + 1) return false;
+			TArray<TSharedPtr<FJsonValue>> Remaining;
+			TSharedPtr<FJsonObject> CreatedSemantic;
+			for (const TSharedPtr<FJsonValue>& Value : *PostNodes)
+			{
+				const TSharedPtr<FJsonObject> Node = Value->AsObject();
+				if (Node.IsValid() && NormalizeGuid(Node->GetStringField(TEXT("existing_node_guid"))) == NormalizeGuid(CreatedNodeGuid))
+				{
+					if (CreatedSemantic.IsValid()) return false;
+					CreatedSemantic = Node;
+				}
+				else Remaining.Add(Value);
+			}
+			if (!CreatedSemantic.IsValid()
+				|| CreatedSemantic->GetStringField(TEXT("node_class")) != TEXT("K2Node_IfThenElse")
+				|| CreatedSemantic->GetStringField(TEXT("semantic_type")) != TEXT("branch")) return false;
+			TSharedPtr<FJsonObject> WithoutCreated = CloneObject(Topology);
+			WithoutCreated->SetArrayField(TEXT("nodes"), Remaining);
+			if (CanonicalJsonObject(WithoutCreated) != CanonicalJsonObject(BaselineTopology)) return false;
+			UEdGraphNode* LiveNode = ResolveNode(Graph, CreatedNodeGuid);
+			if (!LiveNode || !LiveNode->IsA<UK2Node_IfThenElse>()
+				|| LiveNode->NodePosX != static_cast<int32>(PositionX)
+				|| LiveNode->NodePosY != static_cast<int32>(PositionY)
+				|| LiveNode->Pins.Num() != 4) return false;
+			int32 ExecuteInputs = 0, BoolInputs = 0, ThenOutputs = 0, ElseOutputs = 0;
+			for (UEdGraphPin* LivePin : LiveNode->Pins)
+			{
+				if (!LivePin || !LivePin->PinId.IsValid()) return false;
+				if (LivePin->Direction == EGPD_Input && LivePin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec
+					&& LivePin->PinName == UEdGraphSchema_K2::PN_Execute) ++ExecuteInputs;
+				else if (LivePin->Direction == EGPD_Input && LivePin->PinType.PinCategory == UEdGraphSchema_K2::PC_Boolean
+					&& LivePin->PinName == UEdGraphSchema_K2::PN_Condition) ++BoolInputs;
+				else if (LivePin->Direction == EGPD_Output && LivePin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec
+					&& LivePin->PinName == UEdGraphSchema_K2::PN_Then) ++ThenOutputs;
+				else if (LivePin->Direction == EGPD_Output && LivePin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec
+					&& LivePin->PinName == UEdGraphSchema_K2::PN_Else) ++ElseOutputs;
+				else return false;
+			}
+			return ExecuteInputs == 1 && BoolInputs == 1 && ThenOutputs == 1 && ElseOutputs == 1;
+		};
+
+		auto Rollback = [&](const TCHAR* FailurePhase, const FString& FailureCode, bool bPersistedStateUncertain) -> TSharedPtr<FJsonValue>
+		{
+			TSharedPtr<FJsonObject> RollbackEvidence = Attempt(true, false);
+			const bool bForceRollbackFailure = FaultCheckpoint == TEXT("ROLLBACK_FAILURE");
+			bool bMutationRestored = false;
+			if (!bForceRollbackFailure)
+			{
+				if (StageBOperation == EStageBOperation::AddNode)
+				{
+					UEdGraphNode* ExistingAdded = ResolveNode(Graph, CreatedNodeGuid);
+					if (ExistingAdded)
+					{
+						Graph->Modify();
+						ExistingAdded->Modify();
+						Graph->RemoveNode(ExistingAdded);
+						Graph->NotifyGraphChanged();
+						FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+					}
+					bMutationRestored = ResolveNode(Graph, CreatedNodeGuid) == nullptr;
+				}
+				else if (StageBOperation == EStageBOperation::ConnectPins)
+				{
+					if (FromPin->LinkedTo.Contains(ToPin)) Schema->BreakSinglePinLink(FromPin, ToPin);
+					bMutationRestored = !FromPin->LinkedTo.Contains(ToPin) && !ToPin->LinkedTo.Contains(FromPin);
+				}
+				else
+				{
+					const FPinConnectionResponse Response = Schema->CanCreateConnection(FromPin, ToPin);
+					bMutationRestored = Response.Response == CONNECT_RESPONSE_MAKE
+						&& Schema->TryCreateConnection(FromPin, ToPin)
+						&& FromPin->LinkedTo.Contains(ToPin) && ToPin->LinkedTo.Contains(FromPin);
+				}
+			}
+			TSharedPtr<FJsonObject> RollbackCompile;
+			const bool bCompileRestored = bMutationRestored && CompileWithoutSave(Blueprint, RollbackCompile);
+			bool bRollbackComplete = false;
+			const TSharedPtr<FJsonObject> RollbackTopology = SemanticTopology(Graph, GraphType, bRollbackComplete);
+			const bool bSemanticRestored = bCompileRestored && bRollbackComplete
+				&& CanonicalJsonObject(RollbackTopology) == CanonicalJsonObject(BaselineTopology);
+			if (bSemanticRestored && !bPersistedStateUncertain) Package->SetDirtyFlag(false);
+			const bool bCleanRestored = !Package->IsDirty();
+			const bool bRestored = bSemanticRestored && bCleanRestored && !bPersistedStateUncertain;
+			RollbackEvidence->SetBoolField(TEXT("succeeded"), bRestored);
+			RollbackEvidence->SetBoolField(TEXT("semantic_restoration_verified"), bSemanticRestored);
+			RollbackEvidence->SetBoolField(TEXT("clean_state_restored"), bCleanRestored);
+			RollbackEvidence->SetBoolField(TEXT("persisted_state_uncertain"), bPersistedStateUncertain);
+			if (bForceRollbackFailure)
+			{
+				RollbackEvidence->SetBoolField(TEXT("test_failure_injected"), true);
+				RollbackEvidence->SetStringField(TEXT("fault_checkpoint"), FaultCheckpoint);
+			}
+			RollbackEvidence->SetObjectField(TEXT("compile"), RollbackCompile.IsValid() ? RollbackCompile : Attempt(false, false));
+			Evidence->SetObjectField(TEXT("rollback"), RollbackEvidence);
+			DirtyState->SetBoolField(TEXT("final"), Package->IsDirty());
+			if (bRestored)
+				SetFailure(Receipt, FailurePhase, FailureCode, TEXT("RESTORED"), TEXT("Mutation failed and the explicit before-state was restored and verified"));
+			else
+				SetFailure(Receipt, TEXT("ROLLBACK"), TEXT("RESTORATION_UNPROVEN"), TEXT("QUARANTINED"), TEXT("Mutation failed and exact restoration could not be proven"));
+			return Complete(Receipt, FaultCheckpoint == TEXT("AFTER_ROLLBACK_BEFORE_FINAL_RECEIPT"));
+		};
+
+		Blueprint->Modify();
+		Graph->Modify();
+		TSharedPtr<FJsonObject> MutationEvidence = Attempt(true, false);
+		Evidence->SetObjectField(TEXT("mutation"), MutationEvidence);
+		bool bMutated = false;
+		if (StageBOperation == EStageBOperation::AddNode)
+		{
+			UK2Node_IfThenElse* Branch = NewObject<UK2Node_IfThenElse>(Graph);
+			if (Branch)
+			{
+				Graph->AddNode(Branch, false, false);
+				Branch->NodeGuid = ParsedCreatedGuid;
+				Branch->NodePosX = static_cast<int32>(PositionX);
+				Branch->NodePosY = static_cast<int32>(PositionY);
+				Branch->AllocateDefaultPins();
+				Branch->PostPlacedNewNode();
+				Graph->NotifyGraphChanged();
+				FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+				AddedNode = Branch;
+				bMutated = ResolveNode(Graph, CreatedNodeGuid) == Branch;
+			}
+			MutationEvidence->SetNumberField(TEXT("changed_nodes"), bMutated ? 1 : 0);
+			MutationEvidence->SetStringField(TEXT("created_node_guid"), CreatedNodeGuid);
+		}
+		else if (StageBOperation == EStageBOperation::ConnectPins)
+		{
+			bMutated = Schema->TryCreateConnection(FromPin, ToPin)
+				&& FromPin->LinkedTo.Contains(ToPin) && ToPin->LinkedTo.Contains(FromPin);
+			MutationEvidence->SetNumberField(TEXT("changed_connections"), bMutated ? 1 : 0);
+		}
+		else
+		{
+			Schema->BreakSinglePinLink(FromPin, ToPin);
+			bMutated = !FromPin->LinkedTo.Contains(ToPin) && !ToPin->LinkedTo.Contains(FromPin);
+			MutationEvidence->SetNumberField(TEXT("changed_connections"), bMutated ? 1 : 0);
+		}
+		MutationEvidence->SetBoolField(TEXT("succeeded"), bMutated);
+		if (!bMutated) return Rollback(TEXT("MUTATION"), TEXT("STAGE_B_GRAPH_MUTATION_FAILED"), false);
+		if (FaultCheckpoint == TEXT("AFTER_MUTATION") || FaultCheckpoint == TEXT("ROLLBACK_FAILURE")
+			|| FaultCheckpoint == TEXT("AFTER_ROLLBACK_BEFORE_FINAL_RECEIPT"))
+		{
+			MutationEvidence->SetBoolField(TEXT("test_failure_injected"), true);
+			MutationEvidence->SetStringField(TEXT("fault_checkpoint"), FaultCheckpoint);
+			return Rollback(TEXT("MUTATION"), TEXT("FORCED_FAILURE_AFTER_MUTATION"), false);
+		}
+
+		TSharedPtr<FJsonObject> CompileEvidence;
+		const bool bForcedCompileFailure = FaultCheckpoint == TEXT("BEFORE_COMPILE");
+		const bool bCompiled = bForcedCompileFailure ? false : CompileWithoutSave(Blueprint, CompileEvidence);
+		if (bForcedCompileFailure)
+		{
+			CompileEvidence = Attempt(true, false);
+			CompileEvidence->SetNumberField(TEXT("errors"), 1);
+			CompileEvidence->SetNumberField(TEXT("warnings"), 0);
+			CompileEvidence->SetBoolField(TEXT("save_requested"), false);
+			CompileEvidence->SetBoolField(TEXT("test_failure_injected"), true);
+			CompileEvidence->SetStringField(TEXT("fault_checkpoint"), FaultCheckpoint);
+		}
+		Evidence->SetObjectField(TEXT("compile"), CompileEvidence);
+		if (!bCompiled) return Rollback(TEXT("COMPILE"), TEXT("BLUEPRINT_COMPILE_FAILED"), false);
+		if (FaultCheckpoint == TEXT("AFTER_COMPILE_BEFORE_VERIFY"))
+		{
+			CompileEvidence->SetBoolField(TEXT("test_failure_injected"), true);
+			CompileEvidence->SetStringField(TEXT("fault_checkpoint"), FaultCheckpoint);
+			return Rollback(TEXT("VERIFY"), TEXT("FORCED_AFTER_COMPILE_BEFORE_VERIFY"), false);
+		}
+
+		bool bPostComplete = false;
+		const TSharedPtr<FJsonObject> PostTopology = SemanticTopology(Graph, GraphType, bPostComplete);
+		const FString PostFingerprint = bPostComplete ? Sha256(CanonicalJsonObject(PostTopology)) : FString();
+		Evidence->SetStringField(TEXT("post_semantic_fingerprint"), PostFingerprint);
+		const bool bForcedVerifyFailure = FaultCheckpoint == TEXT("VERIFICATION_FAILURE");
+		const bool bVerified = !bForcedVerifyFailure && bPostComplete
+			&& (StageBOperation == EStageBOperation::AddNode
+				? VerifyAddedNode(PostTopology)
+				: CanonicalJsonObject(PostTopology) == CanonicalJsonObject(ExpectedPost));
+		TSharedPtr<FJsonObject> VerificationEvidence = Attempt(true, bVerified);
+		VerificationEvidence->SetBoolField(TEXT("exact_expected_delta"), bVerified);
+		VerificationEvidence->SetBoolField(TEXT("unchanged_invariants"), bVerified);
+		if (StageBOperation == EStageBOperation::AddNode) VerificationEvidence->SetNumberField(TEXT("changed_nodes"), bVerified ? 1 : 0);
+		else VerificationEvidence->SetNumberField(TEXT("changed_connections"), bVerified ? 1 : 0);
+		if (bForcedVerifyFailure)
+		{
+			VerificationEvidence->SetBoolField(TEXT("test_failure_injected"), true);
+			VerificationEvidence->SetStringField(TEXT("fault_checkpoint"), FaultCheckpoint);
+		}
+		Evidence->SetObjectField(TEXT("verification"), VerificationEvidence);
+		if (!bVerified) return Rollback(TEXT("VERIFY"), TEXT("EXACT_SEMANTIC_DELTA_FAILED"), false);
+		if (FaultCheckpoint == TEXT("AFTER_VERIFY_BEFORE_SAVE"))
+		{
+			VerificationEvidence->SetBoolField(TEXT("test_failure_injected"), true);
+			VerificationEvidence->SetStringField(TEXT("fault_checkpoint"), FaultCheckpoint);
+			return Rollback(TEXT("SAVE"), TEXT("FORCED_AFTER_VERIFY_BEFORE_SAVE"), false);
+		}
+
+		TSharedPtr<FJsonObject> SaveEvidence = Attempt(true, false);
+		Evidence->SetObjectField(TEXT("save"), SaveEvidence);
+		const bool bForcedSaveFailure = FaultCheckpoint == TEXT("SAVE_FAILURE");
+		const bool bSaved = !bForcedSaveFailure && UEditorAssetLibrary::SaveLoadedAsset(Blueprint, false);
+		SaveEvidence->SetBoolField(TEXT("succeeded"), bSaved);
+		if (bForcedSaveFailure)
+		{
+			SaveEvidence->SetBoolField(TEXT("test_failure_injected"), true);
+			SaveEvidence->SetStringField(TEXT("fault_checkpoint"), FaultCheckpoint);
+		}
+		if (!bSaved) return Rollback(TEXT("SAVE"), TEXT("BLUEPRINT_SAVE_FAILED"), true);
+
+		bool bPersistedComplete = false;
+		const TSharedPtr<FJsonObject> PersistedTopology = SemanticTopology(Graph, GraphType, bPersistedComplete);
+		const bool bPersisted = bPersistedComplete && !Package->IsDirty()
+			&& (StageBOperation == EStageBOperation::AddNode
+				? VerifyAddedNode(PersistedTopology)
+				: CanonicalJsonObject(PersistedTopology) == CanonicalJsonObject(ExpectedPost));
+		SaveEvidence->SetBoolField(TEXT("persisted_verified"), bPersisted);
+		SaveEvidence->SetBoolField(TEXT("package_clean"), !Package->IsDirty());
+		DirtyState->SetBoolField(TEXT("final"), Package->IsDirty());
+		Evidence->SetObjectField(TEXT("rollback"), Attempt(false, false));
+		TSharedPtr<FJsonObject> ObservedResult = MakeShared<FJsonObject>();
+		ObservedResult->SetStringField(TEXT("operation"), ExpectedSpecKind);
+		ObservedResult->SetStringField(TEXT("semantic_fingerprint"), PostFingerprint);
+		ObservedResult->SetBoolField(TEXT("verified"), bPersisted);
+		Evidence->SetObjectField(TEXT("observed_result"), ObservedResult);
+		if (!bPersisted)
+		{
+			SetFailure(Receipt, TEXT("SAVE"), TEXT("PERSISTED_STATE_UNPROVEN"), TEXT("QUARANTINED"),
+				TEXT("Save returned but persisted clean state could not be proven"));
+			return Complete(Receipt);
+		}
+		Receipt->SetStringField(TEXT("state"), TEXT("SUCCESS"));
+		return Complete(Receipt, FaultCheckpoint == TEXT("AFTER_SAVE_BEFORE_FINAL_RECEIPT"));
+	}
 	FString PackagePath;
 	FString BlueprintName;
 	FString Capability;
