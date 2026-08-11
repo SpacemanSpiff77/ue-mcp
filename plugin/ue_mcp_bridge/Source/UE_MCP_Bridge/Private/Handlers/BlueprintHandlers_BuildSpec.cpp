@@ -1347,15 +1347,20 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 					const TSharedPtr<FJsonObject> Current = SemanticTopology(Graph, GraphType, bCurrentComplete);
 					const FString FromNodeId = SemanticNodeId(Current, FromNode);
 					const FString ToNodeId = SemanticNodeId(Current, ToNode);
+					const TSharedPtr<FJsonObject> FromSemanticPin = FindSemanticPin(Current,
+						FromNode->NodeGuid.ToString(EGuidFormats::Digits), FromPin->PinId.ToString(EGuidFormats::Digits));
+					const TSharedPtr<FJsonObject> ToSemanticPin = FindSemanticPin(Current,
+						ToNode->NodeGuid.ToString(EGuidFormats::Digits), ToPin->PinId.ToString(EGuidFormats::Digits));
 					const TArray<TSharedPtr<FJsonValue>>* ExpectedConnections = ArrayField(ExpectedPost, TEXT("connections"));
-					if (!bCurrentComplete || FromNodeId.IsEmpty() || ToNodeId.IsEmpty() || !ExpectedConnections) bSucceeded = false;
+					if (!bCurrentComplete || FromNodeId.IsEmpty() || ToNodeId.IsEmpty()
+						|| !FromSemanticPin.IsValid() || !ToSemanticPin.IsValid() || !ExpectedConnections) bSucceeded = false;
 					else
 					{
 						TSharedPtr<FJsonObject> ExpectedConnection = MakeShared<FJsonObject>();
 						ExpectedConnection->SetStringField(TEXT("from_node_id"), FromNodeId);
-						ExpectedConnection->SetStringField(TEXT("from_pin_id"), FromPin->PinId.ToString(EGuidFormats::DigitsWithHyphensLower));
+						ExpectedConnection->SetStringField(TEXT("from_pin_id"), FromSemanticPin->GetStringField(TEXT("pin_id")));
 						ExpectedConnection->SetStringField(TEXT("to_node_id"), ToNodeId);
-						ExpectedConnection->SetStringField(TEXT("to_pin_id"), ToPin->PinId.ToString(EGuidFormats::DigitsWithHyphensLower));
+						ExpectedConnection->SetStringField(TEXT("to_pin_id"), ToSemanticPin->GetStringField(TEXT("pin_id")));
 						ExpectedConnection->SetStringField(TEXT("classification"), TEXT("execution"));
 						TArray<TSharedPtr<FJsonValue>> Updated = *ExpectedConnections;
 						if (Version == TEXT("graph.connect-pins@1.0")) Updated.Add(MakeShared<FJsonValueObject>(ExpectedConnection));

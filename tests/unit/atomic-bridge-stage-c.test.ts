@@ -41,5 +41,7 @@ describe("atomic Builder Stage C bounded multi-operation contract", () => {
       expect(handler).toContain(checkpoint);
     expect(handler).toContain('RollbackWholeBuild(TEXT("SAVE"), TEXT("FORCED_SAVE_FAILURE"), FailingOperation, false)');
     expect(handler).toContain('FaultCheckpoint == TEXT("AFTER_ROLLBACK_BEFORE_FINAL_RECEIPT") && Index == Operations->Num() - 1');
+    expect(handler).toContain('ExpectedConnection->SetStringField(TEXT("from_pin_id"), FromSemanticPin->GetStringField(TEXT("pin_id")))');
+    expect(handler).toContain('ExpectedConnection->SetStringField(TEXT("to_pin_id"), ToSemanticPin->GetStringField(TEXT("pin_id")))');
   });
 });
