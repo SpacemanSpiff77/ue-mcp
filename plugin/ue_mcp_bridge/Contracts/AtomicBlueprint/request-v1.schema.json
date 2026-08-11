@@ -251,9 +251,24 @@
     "testHooks": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["force_failure_after_mutation"],
+      "required": ["test_hook_version", "checkpoint"],
       "properties": {
-        "force_failure_after_mutation": { "type": "boolean" }
+        "test_hook_version": { "const": "spacehead.blueprint-atomic-bridge.test-hooks@1.0" },
+        "checkpoint": {
+          "enum": [
+            "BEFORE_PREFLIGHT",
+            "AFTER_PREFLIGHT_BEFORE_MUTATION",
+            "AFTER_MUTATION",
+            "BEFORE_COMPILE",
+            "AFTER_COMPILE_BEFORE_VERIFY",
+            "VERIFICATION_FAILURE",
+            "AFTER_VERIFY_BEFORE_SAVE",
+            "SAVE_FAILURE",
+            "AFTER_SAVE_BEFORE_FINAL_RECEIPT",
+            "ROLLBACK_FAILURE",
+            "AFTER_ROLLBACK_BEFORE_FINAL_RECEIPT"
+          ]
+        }
       }
     }
   }

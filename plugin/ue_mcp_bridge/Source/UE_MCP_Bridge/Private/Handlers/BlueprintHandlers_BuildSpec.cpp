@@ -17,6 +17,7 @@
 #include "Kismet2/CompilerResultsLog.h"
 #include "Kismet2/KismetEditorUtilities.h"
 #include "Misc/EngineVersion.h"
+#include "Misc/App.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Serialization/JsonReader.h"
@@ -38,6 +39,8 @@ namespace
 	const TCHAR* BridgeVersion = TEXT("0.3.0");
 	const TCHAR* InputSchemaVersion = TEXT("spacehead.blueprint-atomic-bridge.request@1.0");
 	const TCHAR* OutputSchemaVersion = TEXT("spacehead.blueprint-atomic-bridge.receipt@1.0");
+	const TCHAR* TestHookVersion = TEXT("spacehead.blueprint-atomic-bridge.test-hooks@1.0");
+	const TCHAR* DurableStatusVersion = TEXT("spacehead.blueprint-atomic-bridge.durable-status@1.0");
 
 	struct FCachedAtomicExecution
 	{
@@ -47,6 +50,13 @@ namespace
 	};
 
 	TMap<FString, FCachedAtomicExecution> CorrelatedExecutions;
+
+	enum class EDurableExecutionRead
+	{
+		Missing,
+		Valid,
+		Corrupt,
+	};
 
 	TSharedPtr<FJsonObject> ObjectField(const TSharedPtr<FJsonObject>& Object, const TCHAR* Name)
 	{
@@ -585,6 +595,119 @@ namespace
 		return IFileManager::Get().Move(*Path, *Temporary, true, true, false, true);
 	}
 
+	FString DurableExecutionFile(const FString& TransactionId, const FString& CorrelationId)
+	{
+		const FString Directory = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("SpaceheadBuilder"), TEXT("Transactions"));
+		IFileManager::Get().MakeDirectory(*Directory, true);
+		return FPaths::Combine(Directory, Sha256(TransactionId + TEXT("|") + CorrelationId) + TEXT(".json"));
+	}
+
+	bool AtomicReplaceUtf8(const FString& Path, const FString& Value)
+	{
+		const FString Temporary = Path + TEXT(".") + FGuid::NewGuid().ToString(EGuidFormats::Digits) + TEXT(".tmp");
+		const FTCHARToUTF8 Utf8(*Value);
+		IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+		TUniquePtr<IFileHandle> Handle(PlatformFile.OpenWrite(*Temporary, false, false));
+		if (!Handle.IsValid()
+			|| !Handle->Write(reinterpret_cast<const uint8*>(Utf8.Get()), Utf8.Length())
+			|| !Handle->Flush(true))
+		{
+			Handle.Reset();
+			IFileManager::Get().Delete(*Temporary, false, true, true);
+			return false;
+		}
+		Handle.Reset();
+		if (IFileManager::Get().Move(*Path, *Temporary, true, true, false, true)) return true;
+		IFileManager::Get().Delete(*Temporary, false, true, true);
+		return false;
+	}
+
+	bool PersistDurableExecution(
+		const FString& TransactionId,
+		const FString& CorrelationId,
+		const FString& PlanHash,
+		const TSharedPtr<FJsonObject>& Fencing,
+		const TSharedPtr<FJsonObject>& Receipt)
+	{
+		if (!ValidHash(PlanHash) || !Receipt.IsValid()) return false;
+		TSharedPtr<FJsonObject> Envelope = MakeShared<FJsonObject>();
+		Envelope->SetStringField(TEXT("status_version"), DurableStatusVersion);
+		Envelope->SetStringField(TEXT("transaction_id"), TransactionId);
+		Envelope->SetStringField(TEXT("correlation_id"), CorrelationId);
+		Envelope->SetStringField(TEXT("plan_hash"), PlanHash);
+		Envelope->SetStringField(TEXT("bridge_git_commit"), UE_MCP_AtomicBuildIdentity::GitCommit);
+		Envelope->SetStringField(TEXT("bridge_build_fingerprint"), UE_MCP_AtomicBuildIdentity::BuildFingerprint);
+		Envelope->SetStringField(TEXT("recorded_at"), FDateTime::UtcNow().ToIso8601());
+		Envelope->SetObjectField(TEXT("fencing"), Fencing.IsValid() ? CloneObject(Fencing) : MakeShared<FJsonObject>());
+		Envelope->SetObjectField(TEXT("receipt"), CloneObject(Receipt));
+		Envelope->SetStringField(TEXT("integrity_sha256"), Sha256(CanonicalJsonObject(Envelope)));
+		return AtomicReplaceUtf8(DurableExecutionFile(TransactionId, CorrelationId), CompactJson(Envelope) + TEXT("\n"));
+	}
+
+	EDurableExecutionRead ReadDurableExecution(
+		const FString& TransactionId,
+		const FString& CorrelationId,
+		FCachedAtomicExecution& Execution)
+	{
+		FString Text;
+		if (!FFileHelper::LoadFileToString(Text, *DurableExecutionFile(TransactionId, CorrelationId)))
+			return EDurableExecutionRead::Missing;
+		TSharedPtr<FJsonObject> Envelope;
+		const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Text);
+		if (!FJsonSerializer::Deserialize(Reader, Envelope) || !Envelope.IsValid()) return EDurableExecutionRead::Corrupt;
+		FString Version;
+		FString StoredTransaction;
+		FString StoredCorrelation;
+		FString PlanHash;
+		FString GitCommit;
+		FString Fingerprint;
+		FString Integrity;
+		FString ReceiptTransaction;
+		FString ReceiptCorrelation;
+		const TSharedPtr<FJsonObject> Receipt = ObjectField(Envelope, TEXT("receipt"));
+		if (!Envelope->TryGetStringField(TEXT("status_version"), Version) || Version != DurableStatusVersion
+			|| !Envelope->TryGetStringField(TEXT("transaction_id"), StoredTransaction) || StoredTransaction != TransactionId
+			|| !Envelope->TryGetStringField(TEXT("correlation_id"), StoredCorrelation) || StoredCorrelation != CorrelationId
+			|| !Envelope->TryGetStringField(TEXT("plan_hash"), PlanHash) || !ValidHash(PlanHash)
+			|| !Envelope->TryGetStringField(TEXT("bridge_git_commit"), GitCommit) || GitCommit != UE_MCP_AtomicBuildIdentity::GitCommit
+			|| !Envelope->TryGetStringField(TEXT("bridge_build_fingerprint"), Fingerprint) || Fingerprint != UE_MCP_AtomicBuildIdentity::BuildFingerprint
+			|| !Envelope->TryGetStringField(TEXT("integrity_sha256"), Integrity) || !ValidHash(Integrity)
+			|| Sha256(CanonicalJsonObject(WithoutField(Envelope, TEXT("integrity_sha256")))) != Integrity
+			|| !Receipt.IsValid()
+			|| !Receipt->TryGetStringField(TEXT("transaction_id"), ReceiptTransaction) || ReceiptTransaction != TransactionId
+			|| !Receipt->TryGetStringField(TEXT("correlation_id"), ReceiptCorrelation) || ReceiptCorrelation != CorrelationId)
+			return EDurableExecutionRead::Corrupt;
+		Execution = { CorrelationId, PlanHash, Receipt };
+		return EDurableExecutionRead::Valid;
+	}
+
+	bool IsKnownFaultCheckpoint(const FString& Checkpoint)
+	{
+		return Checkpoint == TEXT("BEFORE_PREFLIGHT")
+			|| Checkpoint == TEXT("AFTER_PREFLIGHT_BEFORE_MUTATION")
+			|| Checkpoint == TEXT("AFTER_MUTATION")
+			|| Checkpoint == TEXT("BEFORE_COMPILE")
+			|| Checkpoint == TEXT("AFTER_COMPILE_BEFORE_VERIFY")
+			|| Checkpoint == TEXT("VERIFICATION_FAILURE")
+			|| Checkpoint == TEXT("AFTER_VERIFY_BEFORE_SAVE")
+			|| Checkpoint == TEXT("SAVE_FAILURE")
+			|| Checkpoint == TEXT("AFTER_SAVE_BEFORE_FINAL_RECEIPT")
+			|| Checkpoint == TEXT("ROLLBACK_FAILURE")
+			|| Checkpoint == TEXT("AFTER_ROLLBACK_BEFORE_FINAL_RECEIPT");
+	}
+
+	bool ReadTestFaultCheckpoint(const TSharedPtr<FJsonObject>& Hooks, const FString& PackagePath, FString& Checkpoint)
+	{
+		if (!Hooks.IsValid()) return true;
+		FString Version;
+		return FString(FApp::GetProjectName()).Equals(TEXT("ue_mcp"), ESearchCase::CaseSensitive)
+			&& PackagePath.StartsWith(TEXT("/Game/Tests/Builder/"))
+			&& Hooks->Values.Num() == 2
+			&& Hooks->TryGetStringField(TEXT("test_hook_version"), Version) && Version == TestHookVersion
+			&& Hooks->TryGetStringField(TEXT("checkpoint"), Checkpoint)
+			&& IsKnownFaultCheckpoint(Checkpoint);
+	}
+
 	TSharedPtr<FJsonObject> Readiness()
 	{
 		FString InputDigest;
@@ -735,10 +858,20 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 	if (RequestKind == TEXT("status"))
 	{
 		if (const FCachedAtomicExecution* Cached = CorrelatedExecutions.Find(CacheKey)) return MCPResult(Cached->Receipt);
+		FCachedAtomicExecution Durable;
+		const EDurableExecutionRead DurableRead = ReadDurableExecution(TransactionId, CorrelationId, Durable);
+		if (DurableRead == EDurableExecutionRead::Valid)
+		{
+			CorrelatedExecutions.Add(CacheKey, Durable);
+			return MCPResult(Durable.Receipt);
+		}
 		TSharedPtr<FJsonObject> Unknown = BaseReceipt(TransactionId, CorrelationId, TEXT("UNKNOWN"));
 		Unknown->SetBoolField(TEXT("received_by_bridge"), false);
-		SetFailure(Unknown, TEXT("TRANSPORT_UNKNOWN"), TEXT("CORRELATED_STATUS_NOT_FOUND"), TEXT("UNKNOWN"),
-			TEXT("The bridge has no process-memory receipt for this correlation"));
+		SetFailure(Unknown, TEXT("TRANSPORT_UNKNOWN"),
+			DurableRead == EDurableExecutionRead::Corrupt ? TEXT("CORRELATED_STATUS_CORRUPT") : TEXT("CORRELATED_STATUS_NOT_FOUND"),
+			TEXT("UNKNOWN"), DurableRead == EDurableExecutionRead::Corrupt
+				? TEXT("Durable correlated status failed integrity or build-identity verification")
+				: TEXT("The bridge has no durable receipt for this correlation"));
 		return MCPResult(Unknown);
 	}
 	if (RequestKind != TEXT("dispatch")) return MCPError(TEXT("INVALID_ATOMIC_REQUEST_KIND"));
@@ -767,10 +900,34 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		if (Cached->PlanHash != PlanHash) return MCPError(TEXT("ATOMIC_CORRELATION_CONFLICT"));
 		return MCPResult(Cached->Receipt);
 	}
+	FCachedAtomicExecution Durable;
+	const EDurableExecutionRead DurableRead = ReadDurableExecution(TransactionId, CorrelationId, Durable);
+	if (DurableRead == EDurableExecutionRead::Valid)
+	{
+		if (Durable.PlanHash != PlanHash) return MCPError(TEXT("ATOMIC_CORRELATION_CONFLICT"));
+		CorrelatedExecutions.Add(CacheKey, Durable);
+		return MCPResult(Durable.Receipt);
+	}
+	if (DurableRead == EDurableExecutionRead::Corrupt)
+	{
+		SetFailure(Receipt, TEXT("INTERNAL_CONTRACT"), TEXT("DURABLE_STATUS_CORRUPT"), TEXT("QUARANTINED"),
+			TEXT("A corrupt durable transaction record denies mutation"));
+		return MCPResult(Receipt);
+	}
 	CorrelatedExecutions.Add(CacheKey, { CorrelationId, PlanHash, Receipt });
 
 	const TSharedPtr<FJsonObject> Target = ObjectField(Plan, TEXT("target"));
 	const TSharedPtr<FJsonObject> TestHooks = ObjectField(Params, TEXT("test_hooks"));
+	auto Complete = [&](TSharedPtr<FJsonObject> CompletedReceipt, bool bSuppressFinalReceipt = false) -> TSharedPtr<FJsonValue>
+	{
+		if (!PersistDurableExecution(TransactionId, CorrelationId, PlanHash, Fencing, CompletedReceipt))
+		{
+			SetFailure(CompletedReceipt, TEXT("INTERNAL_CONTRACT"), TEXT("DURABLE_STATUS_WRITE_FAILED"), TEXT("QUARANTINED"),
+				TEXT("Atomic outcome could not be durably recorded"));
+		}
+		CorrelatedExecutions.Add(CacheKey, { CorrelationId, PlanHash, CompletedReceipt });
+		return bSuppressFinalReceipt ? MCPError(TEXT("TEST_ONLY_FINAL_RECEIPT_SUPPRESSED")) : MCPResult(CompletedReceipt);
+	};
 	const TArray<TSharedPtr<FJsonValue>>* Selectors = ArrayField(Target, TEXT("graph_selectors"));
 	const TArray<TSharedPtr<FJsonValue>>* Operations = ArrayField(Plan, TEXT("operations"));
 	const TSharedPtr<FJsonObject> Operation = Operations && Operations->Num() == 1 ? (*Operations)[0]->AsObject() : nullptr;
@@ -805,7 +962,14 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		|| bExpected == bDesired)
 	{
 		SetFailure(Receipt, TEXT("SPEC"), TEXT("UNQUALIFIED_ATOMIC_PLAN"), TEXT("FAILED_PRE_MUTATION"), TEXT("Only one disposable bool set_pin_default plan is executable"));
-		return MCPResult(Receipt);
+		return Complete(Receipt);
+	}
+	FString FaultCheckpoint;
+	if (!ReadTestFaultCheckpoint(TestHooks, PackagePath, FaultCheckpoint))
+	{
+		SetFailure(Receipt, TEXT("SPEC"), TEXT("TEST_HOOKS_NOT_AUTHORIZED"), TEXT("FAILED_PRE_MUTATION"),
+			TEXT("Fault injection requires the versioned disposable ue_mcp test-project gate"));
+		return Complete(Receipt);
 	}
 	const TSharedPtr<FJsonObject> SpecTarget = ObjectField(BuildSpec, TEXT("target"));
 	const TArray<TSharedPtr<FJsonValue>>* SpecOperations = ArrayField(BuildSpec, TEXT("operations"));
@@ -851,7 +1015,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 	{
 		SetFailure(Receipt, TEXT("SPEC"), TEXT("BUILD_SPEC_PLAN_MISMATCH"), TEXT("FAILED_PRE_MUTATION"),
 			TEXT("Canonical BuildSpec semantics do not exactly match the executable BuildPlan"));
-		return MCPResult(Receipt);
+		return Complete(Receipt);
 	}
 
 	FString TargetIdentity;
@@ -868,7 +1032,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		|| !AcceptFencing(TargetIdentity, TransactionId, FencingToken, static_cast<int64>(FencingSequenceNumber)))
 	{
 		SetFailure(Receipt, TEXT("CONCURRENCY"), TEXT("STALE_OR_INVALID_FENCING"), TEXT("FAILED_PRE_MUTATION"), TEXT("Bridge fencing validation failed closed"));
-		return MCPResult(Receipt);
+		return Complete(Receipt);
 	}
 
 	const TSharedPtr<FJsonObject> BaselineTopology = ObjectField(Payload, TEXT("baseline_semantic_topology"));
@@ -879,7 +1043,30 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		|| Sha256(CanonicalJsonObject(BaselineTopology)) != BaselineSemanticHash)
 	{
 		SetFailure(Receipt, TEXT("BASELINE"), TEXT("INVALID_SEMANTIC_BASELINE"), TEXT("FAILED_PRE_MUTATION"), TEXT("Canonical semantic baseline integrity failed"));
-		return MCPResult(Receipt);
+		return Complete(Receipt);
+	}
+	TSharedPtr<FJsonObject> Evidence = ObjectField(Receipt, TEXT("evidence"));
+	Evidence->SetNumberField(TEXT("dispatch_count"), 1);
+	if (!FaultCheckpoint.IsEmpty()) Evidence->SetStringField(TEXT("fault_checkpoint"), FaultCheckpoint);
+	TSharedPtr<FJsonObject> Received = CloneObject(Receipt);
+	Received->SetStringField(TEXT("state"), TEXT("UNKNOWN"));
+	SetFailure(Received, TEXT("TRANSPORT_UNKNOWN"), TEXT("EXECUTION_IN_PROGRESS_OR_INTERRUPTED"), TEXT("UNKNOWN"),
+		TEXT("The bridge durably received the transaction but no terminal outcome is yet recorded"));
+	if (!PersistDurableExecution(TransactionId, CorrelationId, PlanHash, Fencing, Received))
+	{
+		SetFailure(Receipt, TEXT("INTERNAL_CONTRACT"), TEXT("DURABLE_RECEIPT_NOT_ESTABLISHED"), TEXT("QUARANTINED"),
+			TEXT("Mutation was denied because durable correlated evidence could not be established"));
+		return Complete(Receipt);
+	}
+	if (FaultCheckpoint == TEXT("BEFORE_PREFLIGHT"))
+	{
+		TSharedPtr<FJsonObject> Preflight = Attempt(false, false);
+		Preflight->SetBoolField(TEXT("test_failure_injected"), true);
+		Preflight->SetStringField(TEXT("fault_checkpoint"), FaultCheckpoint);
+		Evidence->SetObjectField(TEXT("preflight"), Preflight);
+		SetFailure(Receipt, TEXT("LIVE_PREFLIGHT"), TEXT("FORCED_BEFORE_PREFLIGHT"), TEXT("FAILED_PRE_MUTATION"),
+			TEXT("Test-only failure injected before live preflight"));
+		return Complete(Receipt);
 	}
 
 	UBlueprint* Blueprint = LoadBlueprint(PackagePath);
@@ -901,7 +1088,6 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		&& !Pin->bDefaultValueIsReadOnly && Pin->LinkedTo.IsEmpty()
 		&& Pin->DefaultValue == ExpectedDefault
 		&& CanonicalJsonObject(PreTopology) == CanonicalJsonObject(BaselineTopology);
-	TSharedPtr<FJsonObject> Evidence = ObjectField(Receipt, TEXT("evidence"));
 	TSharedPtr<FJsonObject> DirtyState = MakeShared<FJsonObject>();
 	DirtyState->SetBoolField(TEXT("before"), bDirtyBefore);
 	DirtyState->SetBoolField(TEXT("after_preflight"), bDirtyAfterPreflight);
@@ -916,7 +1102,15 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 	if (!bPreflight)
 	{
 		SetFailure(Receipt, TEXT("LIVE_PREFLIGHT"), TEXT("STALE_PLAN_OR_TARGET_MISMATCH"), TEXT("FAILED_PRE_MUTATION"), TEXT("Live Unreal preflight did not exactly match the BuildPlan"));
-		return MCPResult(Receipt);
+		return Complete(Receipt);
+	}
+	if (FaultCheckpoint == TEXT("AFTER_PREFLIGHT_BEFORE_MUTATION"))
+	{
+		Preflight->SetBoolField(TEXT("test_failure_injected"), true);
+		Preflight->SetStringField(TEXT("fault_checkpoint"), FaultCheckpoint);
+		SetFailure(Receipt, TEXT("LIVE_PREFLIGHT"), TEXT("FORCED_AFTER_PREFLIGHT"), TEXT("FAILED_PRE_MUTATION"),
+			TEXT("Test-only failure injected after live preflight and before mutation"));
+		return Complete(Receipt);
 	}
 
 	const FString OriginalDefault = Pin->DefaultValue;
@@ -925,7 +1119,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 	if (!ExpectedPost.IsValid() || !ExpectedPin.IsValid())
 	{
 		SetFailure(Receipt, TEXT("INTERNAL_CONTRACT"), TEXT("EXPECTED_DELTA_APPLICATION_FAILED"), TEXT("FAILED_PRE_MUTATION"), TEXT("Expected semantic delta could not be applied"));
-		return MCPResult(Receipt);
+		return Complete(Receipt);
 	}
 	ExpectedPin->SetBoolField(TEXT("default_value"), bDesired);
 
@@ -933,9 +1127,10 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 	{
 		TSharedPtr<FJsonObject> RollbackEvidence = Attempt(true, false);
 		const UEdGraphSchema* Schema = Graph->GetSchema();
-		if (Schema) Schema->TrySetDefaultValue(*Pin, OriginalDefault);
+		const bool bForceRollbackFailure = FaultCheckpoint == TEXT("ROLLBACK_FAILURE");
+		if (Schema && !bForceRollbackFailure) Schema->TrySetDefaultValue(*Pin, OriginalDefault);
 		TSharedPtr<FJsonObject> RollbackCompile;
-		const bool bCompileRestored = Schema && Pin->DefaultValue == OriginalDefault
+		const bool bCompileRestored = !bForceRollbackFailure && Schema && Pin->DefaultValue == OriginalDefault
 			&& CompileWithoutSave(Blueprint, RollbackCompile);
 		bool bRollbackComplete = false;
 		const TSharedPtr<FJsonObject> RollbackTopology = SemanticTopology(Graph,
@@ -949,6 +1144,11 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		RollbackEvidence->SetBoolField(TEXT("semantic_restoration_verified"), bSemanticRestored);
 		RollbackEvidence->SetBoolField(TEXT("clean_state_restored"), bCleanRestored);
 		RollbackEvidence->SetBoolField(TEXT("persisted_state_uncertain"), bPersistedStateUncertain);
+		if (bForceRollbackFailure)
+		{
+			RollbackEvidence->SetBoolField(TEXT("test_failure_injected"), true);
+			RollbackEvidence->SetStringField(TEXT("fault_checkpoint"), FaultCheckpoint);
+		}
 		RollbackEvidence->SetObjectField(TEXT("compile"), RollbackCompile.IsValid() ? RollbackCompile : Attempt(false, false));
 		Evidence->SetObjectField(TEXT("rollback"), RollbackEvidence);
 		DirtyState->SetBoolField(TEXT("final"), Package->IsDirty());
@@ -960,7 +1160,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		{
 			SetFailure(Receipt, TEXT("ROLLBACK"), TEXT("RESTORATION_UNPROVEN"), TEXT("QUARANTINED"), TEXT("Mutation failed and exact restoration could not be proven"));
 		}
-		return MCPResult(Receipt);
+		return Complete(Receipt, FaultCheckpoint == TEXT("AFTER_ROLLBACK_BEFORE_FINAL_RECEIPT"));
 	};
 
 	Blueprint->Modify();
@@ -974,36 +1174,72 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 	Mutation->SetBoolField(TEXT("succeeded"), bMutated);
 	Mutation->SetNumberField(TEXT("changed_pin_defaults"), bMutated ? 1 : 0);
 	if (!bMutated) return Rollback(TEXT("MUTATION"), TEXT("SET_PIN_DEFAULT_FAILED"), false);
-	bool bForceFailureAfterMutation = false;
-	if (TestHooks.IsValid()) TestHooks->TryGetBoolField(TEXT("force_failure_after_mutation"), bForceFailureAfterMutation);
-	if (bForceFailureAfterMutation)
+	if (FaultCheckpoint == TEXT("AFTER_MUTATION")
+		|| FaultCheckpoint == TEXT("ROLLBACK_FAILURE")
+		|| FaultCheckpoint == TEXT("AFTER_ROLLBACK_BEFORE_FINAL_RECEIPT"))
 	{
 		Mutation->SetBoolField(TEXT("test_failure_injected"), true);
-		return Rollback(TEXT("TEST_INJECTION"), TEXT("FORCED_FAILURE_AFTER_MUTATION"), false);
+		Mutation->SetStringField(TEXT("fault_checkpoint"), FaultCheckpoint);
+		return Rollback(TEXT("MUTATION"), TEXT("FORCED_FAILURE_AFTER_MUTATION"), false);
 	}
 
 	TSharedPtr<FJsonObject> CompileEvidence;
-	const bool bCompiled = CompileWithoutSave(Blueprint, CompileEvidence);
+	const bool bForcedCompileFailure = FaultCheckpoint == TEXT("BEFORE_COMPILE");
+	const bool bCompiled = bForcedCompileFailure ? false : CompileWithoutSave(Blueprint, CompileEvidence);
+	if (bForcedCompileFailure)
+	{
+		CompileEvidence = Attempt(true, false);
+		CompileEvidence->SetNumberField(TEXT("errors"), 1);
+		CompileEvidence->SetNumberField(TEXT("warnings"), 0);
+		CompileEvidence->SetBoolField(TEXT("save_requested"), false);
+		CompileEvidence->SetBoolField(TEXT("test_failure_injected"), true);
+		CompileEvidence->SetStringField(TEXT("fault_checkpoint"), FaultCheckpoint);
+	}
 	Evidence->SetObjectField(TEXT("compile"), CompileEvidence);
 	if (!bCompiled) return Rollback(TEXT("COMPILE"), TEXT("BLUEPRINT_COMPILE_FAILED"), false);
+	if (FaultCheckpoint == TEXT("AFTER_COMPILE_BEFORE_VERIFY"))
+	{
+		CompileEvidence->SetBoolField(TEXT("test_failure_injected"), true);
+		CompileEvidence->SetStringField(TEXT("fault_checkpoint"), FaultCheckpoint);
+		return Rollback(TEXT("VERIFY"), TEXT("FORCED_AFTER_COMPILE_BEFORE_VERIFY"), false);
+	}
 
 	bool bPostComplete = false;
 	const TSharedPtr<FJsonObject> PostTopology = SemanticTopology(Graph,
 		BaselineTopology->GetObjectField(TEXT("graph"))->GetStringField(TEXT("graph_type")), bPostComplete);
 	const FString PostFingerprint = bPostComplete ? Sha256(CanonicalJsonObject(PostTopology)) : FString();
 	Evidence->SetStringField(TEXT("post_semantic_fingerprint"), PostFingerprint);
-	const bool bVerified = bPostComplete && CanonicalJsonObject(PostTopology) == CanonicalJsonObject(ExpectedPost);
+	const bool bForcedVerifyFailure = FaultCheckpoint == TEXT("VERIFICATION_FAILURE");
+	const bool bVerified = !bForcedVerifyFailure && bPostComplete
+		&& CanonicalJsonObject(PostTopology) == CanonicalJsonObject(ExpectedPost);
 	TSharedPtr<FJsonObject> Verification = Attempt(true, bVerified);
 	Verification->SetBoolField(TEXT("exact_expected_delta"), bVerified);
 	Verification->SetBoolField(TEXT("unchanged_invariants"), bVerified);
 	Verification->SetNumberField(TEXT("changed_pin_defaults"), bVerified ? 1 : 0);
+	if (bForcedVerifyFailure)
+	{
+		Verification->SetBoolField(TEXT("test_failure_injected"), true);
+		Verification->SetStringField(TEXT("fault_checkpoint"), FaultCheckpoint);
+	}
 	Evidence->SetObjectField(TEXT("verification"), Verification);
 	if (!bVerified) return Rollback(TEXT("VERIFY"), TEXT("EXACT_SEMANTIC_DELTA_FAILED"), false);
+	if (FaultCheckpoint == TEXT("AFTER_VERIFY_BEFORE_SAVE"))
+	{
+		Verification->SetBoolField(TEXT("test_failure_injected"), true);
+		Verification->SetStringField(TEXT("fault_checkpoint"), FaultCheckpoint);
+		return Rollback(TEXT("SAVE"), TEXT("FORCED_AFTER_VERIFY_BEFORE_SAVE"), false);
+	}
 
 	TSharedPtr<FJsonObject> SaveEvidence = Attempt(true, false);
 	Evidence->SetObjectField(TEXT("save"), SaveEvidence);
-	const bool bSaved = UEditorAssetLibrary::SaveLoadedAsset(Blueprint, false);
+	const bool bForcedSaveFailure = FaultCheckpoint == TEXT("SAVE_FAILURE");
+	const bool bSaved = !bForcedSaveFailure && UEditorAssetLibrary::SaveLoadedAsset(Blueprint, false);
 	SaveEvidence->SetBoolField(TEXT("succeeded"), bSaved);
+	if (bForcedSaveFailure)
+	{
+		SaveEvidence->SetBoolField(TEXT("test_failure_injected"), true);
+		SaveEvidence->SetStringField(TEXT("fault_checkpoint"), FaultCheckpoint);
+	}
 	if (!bSaved) return Rollback(TEXT("SAVE"), TEXT("BLUEPRINT_SAVE_FAILED"), true);
 
 	bool bPersistedComplete = false;
@@ -1018,8 +1254,8 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 	if (!bPersisted)
 	{
 		SetFailure(Receipt, TEXT("SAVE"), TEXT("PERSISTED_STATE_UNPROVEN"), TEXT("QUARANTINED"), TEXT("Save returned but persisted clean state could not be proven"));
-		return MCPResult(Receipt);
+		return Complete(Receipt);
 	}
 	Receipt->SetStringField(TEXT("state"), TEXT("SUCCESS"));
-	return MCPResult(Receipt);
+	return Complete(Receipt, FaultCheckpoint == TEXT("AFTER_SAVE_BEFORE_FINAL_RECEIPT"));
 }

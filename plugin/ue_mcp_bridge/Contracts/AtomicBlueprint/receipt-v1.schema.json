@@ -31,6 +31,7 @@
         "topology_version": { "type": "string" },
         "changed_pin_defaults": { "type": "integer", "minimum": 0, "maximum": 1 },
         "test_failure_injected": { "type": "boolean" },
+        "fault_checkpoint": { "type": "string" },
         "errors": { "type": "integer", "minimum": 0 },
         "warnings": { "type": "integer", "minimum": 0 },
         "save_requested": { "const": false },
@@ -48,6 +49,8 @@
     "evidence": {
       "type": "object",
       "properties": {
+        "dispatch_count": { "type": "integer", "minimum": 1, "maximum": 1 },
+        "fault_checkpoint": { "type": "string" },
         "dirty_state": {
           "type": "object",
           "properties": {
@@ -75,7 +78,7 @@
       "properties": {
         "failure_version": { "const": "spacehead.builder-failure@1.0" },
         "phase": {
-          "enum": ["BASELINE", "COMPILE", "CONCURRENCY", "INTERNAL_CONTRACT", "LIVE_PREFLIGHT", "MUTATION", "ROLLBACK", "SAVE", "SPEC", "TEST_INJECTION", "TRANSPORT_UNKNOWN", "VERIFY"]
+          "enum": ["BASELINE", "CAPABILITY", "COMPILE", "CONCURRENCY", "DISPATCH", "INTERNAL_CONTRACT", "LIVE_PREFLIGHT", "MUTATION", "RECOVERY", "RESTART", "ROLLBACK", "SAVE", "SPEC", "TRANSPORT_UNKNOWN", "VERIFY"]
         },
         "code": { "type": "string", "minLength": 1 },
         "retryable": { "const": false },
