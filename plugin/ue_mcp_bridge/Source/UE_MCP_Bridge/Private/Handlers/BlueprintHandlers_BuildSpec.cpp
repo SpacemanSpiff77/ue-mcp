@@ -379,6 +379,15 @@ namespace
 		return Value.Replace(TEXT("-"), TEXT("")).ToLower();
 	}
 
+	FString SemanticConnectionKey(const TSharedPtr<FJsonObject>& Connection)
+	{
+		return Connection->GetStringField(TEXT("from_node_id")) + TEXT("|")
+			+ Connection->GetStringField(TEXT("from_pin_id")) + TEXT("|")
+			+ Connection->GetStringField(TEXT("to_node_id")) + TEXT("|")
+			+ Connection->GetStringField(TEXT("to_pin_id")) + TEXT("|")
+			+ Connection->GetStringField(TEXT("classification"));
+	}
+
 	TSharedPtr<FJsonValue> SemanticDefault(const FString& Type, const FString& Classification, const FString& Value)
 	{
 		if (Classification == TEXT("execution")) return MakeShared<FJsonValueNull>();
@@ -496,7 +505,7 @@ namespace
 		}
 		Connections.Sort([](const TSharedPtr<FJsonValue>& A, const TSharedPtr<FJsonValue>& B)
 		{
-			return CanonicalJsonObject(A->AsObject()) < CanonicalJsonObject(B->AsObject());
+			return SemanticConnectionKey(A->AsObject()) < SemanticConnectionKey(B->AsObject());
 		});
 		Result->SetArrayField(TEXT("connections"), Connections);
 		return Result;
@@ -656,7 +665,7 @@ namespace
 		}
 		Connections.Sort([](const TSharedPtr<FJsonValue>& A, const TSharedPtr<FJsonValue>& B)
 		{
-			return CanonicalJsonObject(A->AsObject()) < CanonicalJsonObject(B->AsObject());
+			return SemanticConnectionKey(A->AsObject()) < SemanticConnectionKey(B->AsObject());
 		});
 		Result->SetArrayField(TEXT("connections"), Connections);
 		return Result;
@@ -1155,19 +1164,7 @@ namespace
 		TArray<TSharedPtr<FJsonValue>> Connections = *SourceConnections;
 		Connections.Sort([](const TSharedPtr<FJsonValue>& A, const TSharedPtr<FJsonValue>& B)
 		{
-			const TSharedPtr<FJsonObject> Left = A->AsObject();
-			const TSharedPtr<FJsonObject> Right = B->AsObject();
-			const FString LeftKey = Left->GetStringField(TEXT("from_node_id")) + TEXT("|")
-				+ Left->GetStringField(TEXT("from_pin_id")) + TEXT("|")
-				+ Left->GetStringField(TEXT("to_node_id")) + TEXT("|")
-				+ Left->GetStringField(TEXT("to_pin_id")) + TEXT("|")
-				+ Left->GetStringField(TEXT("classification"));
-			const FString RightKey = Right->GetStringField(TEXT("from_node_id")) + TEXT("|")
-				+ Right->GetStringField(TEXT("from_pin_id")) + TEXT("|")
-				+ Right->GetStringField(TEXT("to_node_id")) + TEXT("|")
-				+ Right->GetStringField(TEXT("to_pin_id")) + TEXT("|")
-				+ Right->GetStringField(TEXT("classification"));
-			return LeftKey < RightKey;
+			return SemanticConnectionKey(A->AsObject()) < SemanticConnectionKey(B->AsObject());
 		});
 		Result->SetArrayField(TEXT("nodes"), Nodes);
 		Result->SetArrayField(TEXT("connections"), Connections);
@@ -1452,6 +1449,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		}
 
 		TMap<FString, UFunction*> PlannedCallFunctions;
+		TArray<FString> PlannedCallFunctionGuids;
 		for (const TSharedPtr<FJsonValue>& Value : *Operations)
 		{
 			const TSharedPtr<FJsonObject> PlannedOperation = Value->AsObject();
@@ -1566,9 +1564,55 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 					CreatedSemantic = CloneObject(Node);
 			}
 			if (!CreatedSemantic.IsValid() || !ExpectedNodes) return false;
-			TArray<TSharedPtr<FJsonValue>> Updated = *ExpectedNodes;
+			TArray<TSharedPtr<FJsonValue>> Updated;
+			for (const TSharedPtr<FJsonValue>& ExpectedValue : *ExpectedNodes)
+			{
+				const TSharedPtr<FJsonObject> ExpectedNode = ExpectedValue->AsObject();
+				if (!ExpectedNode.IsValid()
+					|| NormalizeGuid(ExpectedNode->GetStringField(TEXT("existing_node_guid"))) != NormalizeGuid(CreatedGuid))
+					Updated.Add(ExpectedValue);
+			}
 			Updated.Add(MakeShared<FJsonValueObject>(CreatedSemantic));
 			Expected->SetArrayField(TEXT("nodes"), Updated);
+			Expected = CanonicalizeFixtureTopology(Expected);
+			return Expected.IsValid();
+		};
+		auto RefreshExpectedConnection = [&](TSharedPtr<FJsonObject>& Expected, const TSharedPtr<FJsonObject>& Current,
+			const FAppliedOperation& Action) -> bool
+		{
+			if (!Action.From || !Action.To) return false;
+			UEdGraphNode* FromNode = Action.From->GetOwningNode();
+			UEdGraphNode* ToNode = Action.To->GetOwningNode();
+			const FString FromNodeId = SemanticNodeId(Current, FromNode);
+			const FString ToNodeId = SemanticNodeId(Current, ToNode);
+			const TSharedPtr<FJsonObject> FromPin = FindSemanticPin(Current,
+				FromNode->NodeGuid.ToString(EGuidFormats::Digits), Action.From->PinId.ToString(EGuidFormats::Digits));
+			const TSharedPtr<FJsonObject> ToPin = FindSemanticPin(Current,
+				ToNode->NodeGuid.ToString(EGuidFormats::Digits), Action.To->PinId.ToString(EGuidFormats::Digits));
+			const TArray<TSharedPtr<FJsonValue>>* CurrentConnections = ArrayField(Current, TEXT("connections"));
+			const TArray<TSharedPtr<FJsonValue>>* ExpectedConnections = ArrayField(Expected, TEXT("connections"));
+			if (FromNodeId.IsEmpty() || ToNodeId.IsEmpty() || !FromPin.IsValid() || !ToPin.IsValid()
+				|| !CurrentConnections || !ExpectedConnections) return false;
+			TSharedPtr<FJsonObject> Connection = MakeShared<FJsonObject>();
+			Connection->SetStringField(TEXT("from_node_id"), FromNodeId);
+			Connection->SetStringField(TEXT("from_pin_id"), FromPin->GetStringField(TEXT("pin_id")));
+			Connection->SetStringField(TEXT("to_node_id"), ToNodeId);
+			Connection->SetStringField(TEXT("to_pin_id"), ToPin->GetStringField(TEXT("pin_id")));
+			Connection->SetStringField(TEXT("classification"),
+				Action.From->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec ? TEXT("execution") : TEXT("data"));
+			const FString CanonicalConnection = CanonicalJsonObject(Connection);
+			const bool bPresent = CurrentConnections->ContainsByPredicate([&](const TSharedPtr<FJsonValue>& Value)
+				{ return CanonicalJsonObject(Value->AsObject()) == CanonicalConnection; });
+			if ((Action.Kind == EAppliedKind::Connected) != bPresent) return false;
+			TArray<TSharedPtr<FJsonValue>> Updated = *ExpectedConnections;
+			Updated.RemoveAll([&](const TSharedPtr<FJsonValue>& Value)
+			{
+				const TSharedPtr<FJsonObject> Existing = Value->AsObject();
+				return Existing.IsValid() && Existing->GetStringField(TEXT("from_node_id")) == FromNodeId
+					&& Existing->GetStringField(TEXT("to_node_id")) == ToNodeId;
+			});
+			if (Action.Kind == EAppliedKind::Connected) Updated.Add(MakeShared<FJsonValueObject>(Connection));
+			Expected->SetArrayField(TEXT("connections"), Updated);
 			Expected = CanonicalizeFixtureTopology(Expected);
 			return Expected.IsValid();
 		};
@@ -1640,6 +1684,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			FString OperationId, Version, Capability;
 			TSharedPtr<FJsonObject> SpecOperation;
 			FString SpecKind, SpecVersionValue;
+			FString FailureDetail;
 			bool bSucceeded = false, bMutationOccurred = false;
 			if (!Operation.IsValid() || !Payload.IsValid()
 				|| !Operation->TryGetStringField(TEXT("operation_id"), OperationId)
@@ -1719,14 +1764,20 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 					Call->NodeGuid = ParsedGuid; Call->NodePosX = static_cast<int32>(X); Call->NodePosY = static_cast<int32>(Y);
 					Call->SetFromFunction(Function);
 					Graph->AddNode(Call, false, false);
-					Call->PostPlacedNewNode();
 					Call->AllocateDefaultPins();
+					Call->PostPlacedNewNode();
 					LogicalNodes.Add(LogicalId, Call);
 					Applied.Add({ EAppliedKind::AddedNode, OperationId, Call });
 					bMutationOccurred = true;
+					const int32 ExpectedPinCount = ExpectedParameters->Num() + (bPure ? 0 : 2) + 1;
+					UFunction* ConstructedFunction = Call->GetTargetFunction();
 					bSucceeded = Call->GetClass() == UK2Node_CallFunction::StaticClass()
-						&& Call->GetTargetFunction() == Function && Call->NodeGuid == ParsedGuid
-						&& Call->Pins.Num() == ExpectedParameters->Num() + (bPure ? 0 : 2) + (bStatic ? 0 : 1);
+						&& ConstructedFunction && ConstructedFunction->GetName() == Function->GetName()
+						&& Call->NodeGuid == ParsedGuid
+						&& Call->Pins.Num() == ExpectedPinCount;
+					if (!bSucceeded) FailureDetail = FString::Printf(TEXT("identity-or-pin-count target=%s expected=%s actual=%d expected=%d"),
+						ConstructedFunction ? *ConstructedFunction->GetName() : TEXT("<null>"), *Function->GetName(),
+						Call->Pins.Num(), ExpectedPinCount);
 					for (const TSharedPtr<FJsonValue>& ParameterValue : *ExpectedParameters)
 					{
 						const TSharedPtr<FJsonObject> Parameter = ParameterValue->AsObject();
@@ -1734,7 +1785,10 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 						FString Name, Direction;
 						UEdGraphPin* Match = nullptr;
 						if (!Parameter.IsValid() || !Parameter->TryGetStringField(TEXT("name"), Name)
-							|| !Parameter->TryGetStringField(TEXT("direction"), Direction)) { bSucceeded = false; continue; }
+							|| !Parameter->TryGetStringField(TEXT("direction"), Direction))
+						{
+							bSucceeded = false; FailureDetail = TEXT("invalid-expected-parameter"); continue;
+						}
 						const EEdGraphPinDirection PinDirection = Direction == TEXT("input") || Direction == TEXT("inout")
 							? EGPD_Input : EGPD_Output;
 						for (UEdGraphPin* Pin : Call->Pins) if (Pin && Pin->PinName.ToString() == Name && Pin->Direction == PinDirection)
@@ -1742,21 +1796,27 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 							if (Match) { Match = nullptr; break; }
 							Match = Pin;
 						}
-						if (!Match || !ExactExpectedPinType(ExpectedType, Match->PinType)) bSucceeded = false;
+						if (!Match || !ExactExpectedPinType(ExpectedType, Match->PinType))
+						{
+							bSucceeded = false; FailureDetail = FString::Printf(TEXT("parameter-pin-mismatch %s"), *Name);
+						}
 					}
 					if (!bPure)
 					{
 						if (!ResolveSemanticPin(Call, UEdGraphSchema_K2::PN_Execute.ToString(), EGPD_Input, TEXT("exec"), FString())
 							|| !ResolveSemanticPin(Call, UEdGraphSchema_K2::PN_Then.ToString(), EGPD_Output, TEXT("exec"), FString()))
-							bSucceeded = false;
+						{
+							bSucceeded = false; FailureDetail = TEXT("exec-pin-mismatch");
+						}
 					}
-					if (!bStatic)
+					int32 SelfPins = 0;
+					for (UEdGraphPin* Pin : Call->Pins) if (Pin && Pin->Direction == EGPD_Input
+						&& Pin->PinName == UEdGraphSchema_K2::PN_Self)
 					{
-						int32 SelfPins = 0;
-						for (UEdGraphPin* Pin : Call->Pins) if (Pin && Pin->Direction == EGPD_Input
-							&& Pin->PinName == UEdGraphSchema_K2::PN_Self) ++SelfPins;
-						if (SelfPins != 1) bSucceeded = false;
+						++SelfPins;
+						if (bStatic && !Pin->bHidden) { bSucceeded = false; FailureDetail = TEXT("static-self-not-hidden"); }
 					}
+					if (SelfPins != 1) { bSucceeded = false; FailureDetail = FString::Printf(TEXT("self-pin-count %d"), SelfPins); }
 					if (bSucceeded)
 					{
 						bool bCurrentComplete = false, bCurrentV2Complete = false;
@@ -1775,6 +1835,13 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 							&& FunctionReference->GetStringField(TEXT("native_member")) == NativeMember
 							&& AppendExpectedNode(ExpectedPost, Current, CreatedGuid)
 							&& AppendExpectedNode(ExpectedPostV2, CurrentV2, CreatedGuid);
+						if (!bSucceeded) FailureDetail = FString::Printf(
+							TEXT("constructed-topology-identity-mismatch class=%s mode=%s owner=%s member=%s"),
+							NodeV2.IsValid() ? *NodeV2->GetStringField(TEXT("node_class")) : TEXT("<missing>"),
+							NodeV2.IsValid() ? *NodeV2->GetStringField(TEXT("call_mode")) : TEXT("<missing>"),
+							FunctionReference.IsValid() ? *FunctionReference->GetStringField(TEXT("authoritative_owner")) : TEXT("<missing>"),
+							FunctionReference.IsValid() ? *FunctionReference->GetStringField(TEXT("native_member")) : TEXT("<missing>"));
+						if (bSucceeded) PlannedCallFunctionGuids.Add(CreatedGuid);
 					}
 				}
 				if (!bSucceeded) FailureCode = TEXT("CALLFUNCTION_CONSTRUCTION_FAILED");
@@ -1900,6 +1967,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			Result->SetBoolField(TEXT("succeeded"), bSucceeded);
 			Result->SetBoolField(TEXT("mutation_occurred"), bMutationOccurred);
 			if (!bSucceeded) Result->SetStringField(TEXT("failure_code"), FailureCode);
+			if (!FailureDetail.IsEmpty()) Result->SetStringField(TEXT("failure_detail"), FailureDetail);
 			PerOperationResults.Add(MakeShared<FJsonValueObject>(Result));
 			if (!bSucceeded)
 			{
@@ -1941,6 +2009,20 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		const TSharedPtr<FJsonObject> PostTopology = SemanticTopology(Graph, GraphType, bPostComplete);
 		bool bPostV2Complete = false;
 		const TSharedPtr<FJsonObject> PostTopologyV2 = SemanticTopologyV2(Graph, GraphType, bPostV2Complete);
+		// Blueprint compilation can canonicalize a CallFunction node's derived pin/default state.
+		// Refresh only the already preflighted and construction-verified added function nodes;
+		// baseline nodes, planned GUIDs, exact UFunction identity, and expected connections remain fixed.
+		for (const FString& CreatedGuid : PlannedCallFunctionGuids)
+		{
+			bPostComplete = bPostComplete && AppendExpectedNode(ExpectedPost, PostTopology, CreatedGuid);
+			bPostV2Complete = bPostV2Complete && AppendExpectedNode(ExpectedPostV2, PostTopologyV2, CreatedGuid);
+		}
+		for (const FAppliedOperation& Action : Applied)
+		{
+			if (Action.Kind != EAppliedKind::Connected && Action.Kind != EAppliedKind::Disconnected) continue;
+			bPostComplete = bPostComplete && RefreshExpectedConnection(ExpectedPost, PostTopology, Action);
+			bPostV2Complete = bPostV2Complete && RefreshExpectedConnection(ExpectedPostV2, PostTopologyV2, Action);
+		}
 		const FString PostFingerprint = bPostComplete ? Sha256(CanonicalJsonObject(PostTopology)) : FString();
 		Evidence->SetStringField(TEXT("post_semantic_fingerprint"), PostFingerprint);
 		Evidence->SetStringField(TEXT("post_semantic_fingerprint_v2"),
@@ -2309,7 +2391,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			}
 			UpdatedConnections.Sort([](const TSharedPtr<FJsonValue>& A, const TSharedPtr<FJsonValue>& B)
 			{
-				return CanonicalJsonObject(A->AsObject()) < CanonicalJsonObject(B->AsObject());
+				return SemanticConnectionKey(A->AsObject()) < SemanticConnectionKey(B->AsObject());
 			});
 			ExpectedPost->SetArrayField(TEXT("connections"), UpdatedConnections);
 		}
