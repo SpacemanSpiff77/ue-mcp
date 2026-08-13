@@ -150,6 +150,7 @@ public class UE_MCP_Bridge : ModuleRules
 			"Source/UE_MCP_Bridge/Private/Handlers/BlueprintTopologySerializer.h",
 			"Source/UE_MCP_Bridge/Private/Handlers/BlueprintHandlers.cpp",
 			"Source/UE_MCP_Bridge/Private/Handlers/BlueprintHandlers.h",
+			"Source/UE_MCP_Bridge/Private/Handlers/BlueprintHandlers_Discovery.cpp",
 			"Source/UE_MCP_Bridge/Private/Handlers/BlueprintHandlers_BuildSpec.cpp",
 			"Source/UE_MCP_Bridge/UE_MCP_Bridge.Build.cs",
 		};

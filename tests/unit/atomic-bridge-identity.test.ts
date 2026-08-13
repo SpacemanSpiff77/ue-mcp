@@ -46,6 +46,7 @@ describe("atomic bridge exact build and schema identity", () => {
     const handler = readFileSync(resolve(root, "plugin/ue_mcp_bridge/Source/UE_MCP_Bridge/Private/Handlers/BlueprintHandlers_BuildSpec.cpp"), "utf8");
     for (const input of [
       "BlueprintHandlers.cpp", "BlueprintHandlers.h", "BlueprintHandlers_BuildSpec.cpp",
+      "BlueprintHandlers_Discovery.cpp",
       "BlueprintTopologySerializer.cpp", "BlueprintTopologySerializer.h",
       "request-v1.schema.json", "receipt-v1.schema.json",
       "request-v2.schema.json", "receipt-v2.schema.json",

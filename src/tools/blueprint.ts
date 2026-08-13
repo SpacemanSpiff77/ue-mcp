@@ -29,6 +29,7 @@ export const blueprintTool: ToolDef = categoryTool(
     },
     read_blueprint_topology_chunk: bp("Fetch one deterministic base64 chunk from an immutable Full Blueprint topology capture. This reads frozen provider memory and never re-reads Unreal. Params: captureHandle, chunkIndex", "read_blueprint_topology_chunk", (p) => ({ captureHandle: p.captureHandle, chunkIndex: p.chunkIndex })),
     release_blueprint_topology_capture: bp("Release an immutable Full Blueprint topology capture. This never reads or mutates Unreal. Params: captureHandle", "release_blueprint_topology_capture", (p) => ({ captureHandle: p.captureHandle })),
+    discover_actions: bp("Authoritative, paginated, read-only Blueprint action discovery from FBlueprintActionDatabase. Reports exact spawner/K2 classes, reflected members, structured K2 pin types, behavioral metadata, spawner signatures, optional transient template evidence, and availability in named existing graph contexts. Never compiles, saves, invokes a spawner into an authored graph, or mutates assets. Params: offset?, limit?, query?, includeTemplateEvidence?, contexts?: [{id, assetPath, graphName}]", "discover_blueprint_actions", (p) => ({ offset: p.offset, limit: p.limit, query: p.query, includeTemplateEvidence: p.includeTemplateEvidence, contexts: p.contexts })),
     read_graph_summary: bp("Lightweight graph summary (nodes+edges only, ~10KB). Filterable node list. Params: assetPath, graphName?, titleFilter?, classFilter? (#560)", "read_blueprint_graph_summary", (p) => ({ path: p.assetPath, graphName: p.graphName, titleFilter: p.titleFilter, classFilter: p.classFilter })),
     get_execution_flow: bp("Trace exec pins from an entry point. Params: assetPath, graphName?, entryPoint?", "get_blueprint_execution_flow", (p) => ({ path: p.assetPath, graphName: p.graphName, entryPoint: p.entryPoint })),
     get_dependencies:   bp("Forward (classes/functions/assets) or reverse (referencers) deps. Params: assetPath, reverse?", "get_blueprint_dependencies", (p) => ({ path: p.assetPath, reverse: p.reverse })),
@@ -205,6 +206,10 @@ export const blueprintTool: ToolDef = categoryTool(
     outputPath: z.string().optional().describe("Absolute or Saved-relative JSON path for read_graph dumps; default path includes the asset, graph, and a path hash"),
     titleFilter: z.string().optional().describe("read_graph/read_graph_summary: case-insensitive substring match on node title (#560)"),
     classFilter: z.string().optional().describe("read_graph/read_graph_summary: case-insensitive substring match on node class name (#560)"),
+    includeTemplateEvidence: z.boolean().optional().describe("discover_actions: inspect cached/transient template-node class and pin count without authored graph mutation"),
+    contexts: z.array(z.object({
+      id: z.string(), assetPath: z.string(), graphName: z.string(),
+    })).max(8).optional().describe("discover_actions: named existing Blueprint graph contexts for FBlueprintActionFilter availability"),
     parameters: z.array(z.object({
       name: z.string(),
       type: z.string().optional(),
