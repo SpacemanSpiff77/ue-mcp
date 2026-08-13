@@ -90,6 +90,7 @@ void FBlueprintHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("release_blueprint_topology_capture"), &ReleaseBlueprintTopologyCapture);
 	Registry.RegisterHandlerWithTimeout(TEXT("discover_blueprint_actions"), &DiscoverBlueprintActions, ReadBlueprintGraphTimeoutSeconds);
 	Registry.RegisterHandler(TEXT("apply_atomic_build_plan"), &ApplyAtomicBuildPlan);
+	Registry.RegisterHandlerWithTimeout(TEXT("qualify_call_function_candidates"), &QualifyCallFunctionCandidates, 600.0f);
 	Registry.RegisterHandler(TEXT("add_event_dispatcher"), &AddEventDispatcher);
 	Registry.RegisterHandler(TEXT("rename_function"), &RenameFunction);
 	Registry.RegisterHandler(TEXT("delete_function"), &DeleteFunction);

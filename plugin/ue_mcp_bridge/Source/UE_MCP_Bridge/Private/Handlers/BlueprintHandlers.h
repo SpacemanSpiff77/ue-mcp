@@ -39,6 +39,7 @@ private:
 	static TSharedPtr<FJsonValue> ReadBlueprintTopologyChunk(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> DiscoverBlueprintActions(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ApplyAtomicBuildPlan(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> QualifyCallFunctionCandidates(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> AddEventDispatcher(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> RenameFunction(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> DeleteFunction(const TSharedPtr<FJsonObject>& Params);

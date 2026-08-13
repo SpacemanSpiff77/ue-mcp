@@ -763,6 +763,60 @@ namespace
 			&& bTerminalWrapper == Actual.PinValueType.bTerminalIsUObjectWrapper;
 	}
 
+	bool QualifiedDefaultRoundTrips(const UEdGraphPin& Pin, const TSharedPtr<FJsonObject>& Encoded, const FString& Value)
+	{
+		FString Version, Codec, UnrealValue;
+		const TSharedPtr<FJsonObject> ExpectedType = ObjectField(Encoded, TEXT("exact_pin_type"));
+		if (!Encoded.IsValid()
+			|| !Encoded->TryGetStringField(TEXT("codec_version"), Version)
+			|| Version != TEXT("spacehead.call-function-default-codec@1.0")
+			|| !Encoded->TryGetStringField(TEXT("codec"), Codec)
+			|| !Encoded->TryGetStringField(TEXT("unreal_value"), UnrealValue)
+			|| !ExactExpectedPinType(ExpectedType, Pin.PinType)
+			|| Pin.PinType.ContainerType != EPinContainerType::None || Pin.PinType.bIsReference
+			|| Pin.PinType.bIsWeakPointer || Pin.PinType.bIsUObjectWrapper) return false;
+		const FString Category = Pin.PinType.PinCategory.ToString().ToLower();
+		if (Codec != TEXT("float") && Codec != TEXT("double") && UnrealValue != Value) return false;
+		if (Codec == TEXT("bool")) return Category == TEXT("bool") && (Value == TEXT("true") || Value == TEXT("false"));
+		if (Codec == TEXT("byte"))
+		{
+			int32 Parsed = -1;
+			return Category == TEXT("byte") && !Pin.PinType.PinSubCategoryObject.IsValid()
+				&& LexTryParseString(Parsed, *Value) && Parsed >= 0 && Parsed <= 255 && FString::FromInt(Parsed) == Value;
+		}
+		if (Codec == TEXT("int"))
+		{
+			int32 Parsed = 0;
+			return Category == TEXT("int") && LexTryParseString(Parsed, *Value) && FString::FromInt(Parsed) == Value;
+		}
+		if (Codec == TEXT("int64"))
+		{
+			int64 Parsed = 0;
+			return Category == TEXT("int64") && LexTryParseString(Parsed, *Value) && LexToString(Parsed) == Value;
+		}
+		if (Codec == TEXT("float") || Codec == TEXT("double"))
+		{
+			double Requested = 0, Readback = 0;
+			return Category == TEXT("real")
+				&& Pin.PinType.PinSubCategory.ToString().Equals(Codec, ESearchCase::IgnoreCase)
+				&& LexTryParseString(Requested, *UnrealValue) && LexTryParseString(Readback, *Value)
+				&& Requested == Readback;
+		}
+		if (Codec == TEXT("name")) return Category == TEXT("name");
+		if (Codec == TEXT("string")) return Category == TEXT("string");
+		if (Codec == TEXT("enum"))
+		{
+			UEnum* Enum = Cast<UEnum>(Pin.PinType.PinSubCategoryObject.Get());
+			const TSharedPtr<FJsonObject> Semantic = ObjectField(Encoded, TEXT("semantic_value"));
+			FString EnumType, EnumValue;
+			return Category == TEXT("byte") && Enum && Semantic.IsValid()
+				&& Semantic->TryGetStringField(TEXT("enum_type"), EnumType) && EnumType == Enum->GetPathName()
+				&& Semantic->TryGetStringField(TEXT("value"), EnumValue) && EnumValue == Value
+				&& Enum->GetIndexByNameString(Value, EGetByNameFlags::CaseSensitive) != INDEX_NONE;
+		}
+		return false;
+	}
+
 	bool ExactFunctionParameters(UFunction* Function, const TArray<TSharedPtr<FJsonValue>>* Expected)
 	{
 		if (!Function || !Expected) return false;
@@ -1508,6 +1562,8 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			UEdGraphPin* From = nullptr;
 			UEdGraphPin* To = nullptr;
 			FString PreviousDefault;
+			FString DesiredDefault;
+			TSharedPtr<FJsonObject> DefaultCodec;
 		};
 		TArray<FAppliedOperation> Applied;
 		TMap<FString, UEdGraphNode*> LogicalNodes;
@@ -1849,15 +1905,50 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			else if (Version == TEXT("graph.set-pin-default@1.0") && Capability == SemanticCapability && SpecKind == TEXT("set_pin_default"))
 			{
 				const TSharedPtr<FJsonObject> Reference = ObjectField(Payload, TEXT("node_reference"));
+				const TSharedPtr<FJsonObject> DefaultCodec = ObjectField(Payload, TEXT("default_codec"));
 				FString Name, Direction, Category, PinId;
 				bool Expected = false, Desired = false;
 				Payload->TryGetStringField(TEXT("pin_id"), PinId);
 				UEdGraphNode* Node = ResolveReference(Reference);
 				UEdGraphPin* Pin = Payload->TryGetStringField(TEXT("pin_name"), Name)
 					&& Payload->TryGetStringField(TEXT("pin_direction"), Direction) && Direction == TEXT("input")
-					&& Payload->TryGetStringField(TEXT("pin_category"), Category) && Category == TEXT("bool")
+					&& Payload->TryGetStringField(TEXT("pin_category"), Category)
 					? ResolveSemanticPin(Node, Name, EGPD_Input, Category, PinId) : nullptr;
-				if (Pin && Pin->LinkedTo.IsEmpty() && Payload->TryGetBoolField(TEXT("expected_current_value"), Expected)
+				if (DefaultCodec.IsValid())
+				{
+					FString Policy, DesiredValue;
+					if (Pin && Pin->LinkedTo.IsEmpty()
+						&& Payload->TryGetStringField(TEXT("expected_current_policy"), Policy)
+						&& Policy == TEXT("UNREAL_GENERATED_CAPTURED_AFTER_RECONSTRUCTION")
+						&& Payload->TryGetStringField(TEXT("desired_unreal_value"), DesiredValue)
+						&& Pin->DefaultValue != DesiredValue && QualifiedDefaultRoundTrips(*Pin, DefaultCodec, DesiredValue))
+					{
+						const FString Previous = Pin->DefaultValue;
+						Schema->TrySetDefaultValue(*Pin, DesiredValue);
+						bSucceeded = QualifiedDefaultRoundTrips(*Pin, DefaultCodec, Pin->DefaultValue);
+						bMutationOccurred = bSucceeded;
+						if (bSucceeded)
+						{
+							FAppliedOperation AppliedDefault{ EAppliedKind::SetDefault, OperationId };
+							AppliedDefault.To = Pin; AppliedDefault.PreviousDefault = Previous;
+							AppliedDefault.DesiredDefault = Pin->DefaultValue; AppliedDefault.DefaultCodec = CloneObject(DefaultCodec);
+							Applied.Add(AppliedDefault);
+							const FString NodeGuidValue = Node->NodeGuid.ToString(EGuidFormats::DigitsWithHyphensLower);
+							const FString PinGuidValue = Pin->PinId.ToString(EGuidFormats::DigitsWithHyphensLower);
+							const TSharedPtr<FJsonObject> ExpectedPin = FindSemanticPin(ExpectedPost, NodeGuidValue, PinGuidValue);
+							const TSharedPtr<FJsonObject> ExpectedPinV2 = FindSemanticPin(ExpectedPostV2, NodeGuidValue, PinGuidValue);
+							if (!ExpectedPin.IsValid() || !ExpectedPinV2.IsValid()) bSucceeded = false;
+							else
+							{
+								if (Category == TEXT("bool")) ExpectedPin->SetBoolField(TEXT("default_value"), Pin->DefaultValue == TEXT("true"));
+								else ExpectedPin->SetStringField(TEXT("default_value"), Pin->DefaultValue);
+								ExpectedPinV2->SetStringField(TEXT("default_value"), Pin->DefaultValue);
+							}
+						}
+					}
+				}
+				else if (Category == TEXT("bool") && Pin && Pin->LinkedTo.IsEmpty()
+					&& Payload->TryGetBoolField(TEXT("expected_current_value"), Expected)
 					&& Payload->TryGetBoolField(TEXT("desired_value"), Desired) && Expected != Desired
 					&& Pin->DefaultValue == (Expected ? TEXT("true") : TEXT("false")))
 				{
@@ -1867,7 +1958,10 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 					bMutationOccurred = bSucceeded;
 					if (bSucceeded)
 					{
-						Applied.Add({ EAppliedKind::SetDefault, OperationId, nullptr, nullptr, Pin, Previous });
+						FAppliedOperation AppliedDefault{ EAppliedKind::SetDefault, OperationId };
+						AppliedDefault.To = Pin; AppliedDefault.PreviousDefault = Previous;
+						AppliedDefault.DesiredDefault = Pin->DefaultValue;
+						Applied.Add(AppliedDefault);
 						const FString NodeGuidValue = Node->NodeGuid.ToString(EGuidFormats::DigitsWithHyphensLower);
 						const FString PinGuidValue = Pin->PinId.ToString(EGuidFormats::DigitsWithHyphensLower);
 						const TSharedPtr<FJsonObject> ExpectedPin = FindSemanticPin(ExpectedPost, NodeGuidValue, PinGuidValue);
@@ -2050,7 +2144,9 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		}
 		for (const FAppliedOperation& Action : Applied)
 		{
-			if (Action.Kind == EAppliedKind::SetDefault && (!Action.To || Action.To->DefaultValue == Action.PreviousDefault)) bVerified = false;
+			if (Action.Kind == EAppliedKind::SetDefault && (!Action.To || Action.To->DefaultValue == Action.PreviousDefault
+				|| (!Action.DefaultCodec.IsValid() && Action.To->DefaultValue != Action.DesiredDefault)
+				|| (Action.DefaultCodec.IsValid() && !QualifiedDefaultRoundTrips(*Action.To, Action.DefaultCodec, Action.To->DefaultValue)))) bVerified = false;
 			if (Action.Kind == EAppliedKind::Connected && (!Action.From || !Action.To || !Action.From->LinkedTo.Contains(Action.To))) bVerified = false;
 			if (Action.Kind == EAppliedKind::Disconnected && (!Action.From || !Action.To || Action.From->LinkedTo.Contains(Action.To))) bVerified = false;
 		}
@@ -3033,4 +3129,251 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 	}
 	Receipt->SetStringField(TEXT("state"), TEXT("SUCCESS"));
 	return Complete(Receipt, FaultCheckpoint == TEXT("AFTER_SAVE_BEFORE_FINAL_RECEIPT"));
+}
+
+TSharedPtr<FJsonValue> FBlueprintHandlers::QualifyCallFunctionCandidates(const TSharedPtr<FJsonObject>& Params)
+{
+	const TArray<TSharedPtr<FJsonValue>>* Candidates = ArrayField(Params, TEXT("candidates"));
+	FString HarnessVersion, RunId, EnvironmentId, FixturePath;
+	if (!Params.IsValid()
+		|| !Params->TryGetStringField(TEXT("harness_version"), HarnessVersion)
+		|| HarnessVersion != TEXT("spacehead.call-function-qualification-harness@1.0")
+		|| !Params->TryGetStringField(TEXT("run_id"), RunId) || RunId.IsEmpty()
+		|| !Params->TryGetStringField(TEXT("environment_id"), EnvironmentId) || !ValidHash(EnvironmentId)
+		|| !Params->TryGetStringField(TEXT("fixture_path"), FixturePath)
+		|| !FixturePath.StartsWith(TEXT("/Game/Tests/Builder/"))
+		|| !Candidates || Candidates->Num() < 1 || Candidates->Num() > 500)
+		return MCPError(TEXT("INVALID_PARAMS: Invalid bounded CallFunction qualification request"));
+
+	UBlueprint* Blueprint = LoadBlueprint(FixturePath);
+	UEdGraph* Graph = Blueprint ? ResolveTargetGraph(Blueprint, TEXT("graph"), TEXT("EventGraph")) : nullptr;
+	UPackage* Package = Blueprint ? Blueprint->GetOutermost() : nullptr;
+	if (!Blueprint || !Graph || !Package || Package->IsDirty() || !Cast<UEdGraphSchema_K2>(Graph->GetSchema()))
+		return MCPError(TEXT("FIXTURE_UNAVAILABLE: Qualification fixture must be one loaded, clean K2 Blueprint EventGraph"));
+
+	bool bBaselineComplete = false;
+	const TSharedPtr<FJsonObject> Baseline = SemanticTopologyV2(Graph, TEXT("graph"), bBaselineComplete);
+	if (!bBaselineComplete || !Baseline.IsValid())
+		return MCPError(TEXT("FIXTURE_UNAVAILABLE: Qualification fixture baseline topology is incomplete"));
+	const FString BaselineCanonical = CanonicalJsonObject(Baseline);
+	TArray<TSharedPtr<FJsonValue>> Results;
+	FString PreviousCandidate;
+	bool bBatchCleanup = true;
+
+	auto SetFailureResult = [](const TSharedPtr<FJsonObject>& Result, const FString& Phase,
+		const FString& Category, const FString& Error)
+	{
+		Result->SetStringField(TEXT("outcome"), TEXT("FAILED"));
+		Result->SetStringField(TEXT("phase"), Phase);
+		Result->SetStringField(TEXT("category"), Category);
+		Result->SetStringField(TEXT("normalized_error"), Error);
+	};
+
+	for (const TSharedPtr<FJsonValue>& CandidateValue : *Candidates)
+	{
+		const double Started = FPlatformTime::Seconds();
+		const TSharedPtr<FJsonObject> Candidate = CandidateValue->AsObject();
+		TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+		FString CandidateId, Owner, DeclaringOwner, Member, CallMode, ExpectedSpawner, ExpectedNode;
+		FString SignatureDigest, MetadataDigest, BlueprintMemberGuid;
+		double TimeoutMs = 0;
+		const TArray<TSharedPtr<FJsonValue>>* ExpectedParameters = ArrayField(Candidate, TEXT("expected_parameters"));
+		const TSharedPtr<FJsonObject> BehavioralMetadata = ObjectField(Candidate, TEXT("behavioral_metadata"));
+		const bool bShape = Candidate.IsValid()
+			&& Candidate->TryGetStringField(TEXT("candidate_id"), CandidateId) && ValidHash(CandidateId)
+			&& (PreviousCandidate.IsEmpty() || PreviousCandidate < CandidateId)
+			&& Candidate->TryGetStringField(TEXT("authoritative_owner"), Owner) && !Owner.IsEmpty()
+			&& Candidate->TryGetStringField(TEXT("declaring_owner"), DeclaringOwner) && !DeclaringOwner.IsEmpty()
+			&& Candidate->TryGetStringField(TEXT("native_member"), Member) && !Member.IsEmpty()
+			&& Candidate->TryGetStringField(TEXT("call_mode"), CallMode)
+			&& (CallMode == TEXT("static") || CallMode == TEXT("instance"))
+			&& Candidate->TryGetStringField(TEXT("expected_spawner_class"), ExpectedSpawner)
+			&& ExpectedSpawner == TEXT("/Script/BlueprintGraph.BlueprintFunctionNodeSpawner")
+			&& Candidate->TryGetStringField(TEXT("expected_k2_class"), ExpectedNode)
+			&& ExpectedNode == TEXT("/Script/BlueprintGraph.K2Node_CallFunction")
+			&& Candidate->TryGetStringField(TEXT("signature_digest"), SignatureDigest) && ValidHash(SignatureDigest)
+			&& Candidate->TryGetStringField(TEXT("metadata_digest"), MetadataDigest) && ValidHash(MetadataDigest)
+			&& Candidate->TryGetNumberField(TEXT("per_candidate_timeout_ms"), TimeoutMs)
+			&& TimeoutMs >= 100 && TimeoutMs <= 120000 && ExpectedParameters && BehavioralMetadata.IsValid();
+		Result->SetStringField(TEXT("candidate_id"), CandidateId);
+		Result->SetBoolField(TEXT("exact_function_resolved"), false);
+		Result->SetBoolField(TEXT("exact_k2_class"), false);
+		Result->SetBoolField(TEXT("exact_pin_topology"), false);
+		Result->SetBoolField(TEXT("compile_succeeded"), false);
+		Result->SetBoolField(TEXT("semantic_verify_succeeded"), false);
+		Result->SetBoolField(TEXT("cleanup_succeeded"), false);
+		if (!bShape)
+		{
+			SetFailureResult(Result, TEXT("PREFLIGHT"), TEXT("FUNCTION_RESOLUTION_MISMATCH"),
+				TEXT("candidate evidence is malformed, duplicated, or not in deterministic order"));
+			Result->SetNumberField(TEXT("elapsed_ms"), (FPlatformTime::Seconds() - Started) * 1000.0);
+			Results.Add(MakeShared<FJsonValueObject>(Result));
+			continue;
+		}
+		PreviousCandidate = CandidateId;
+		Candidate->TryGetStringField(TEXT("blueprint_member_guid"), BlueprintMemberGuid);
+
+		UClass* OwnerClass = FindObject<UClass>(nullptr, *Owner);
+		if (!OwnerClass) OwnerClass = LoadObject<UClass>(nullptr, *Owner);
+		UFunction* Function = OwnerClass ? OwnerClass->FindFunctionByName(*Member) : nullptr;
+		const bool bStatic = Function && Function->HasAnyFunctionFlags(FUNC_Static);
+		const bool bCallable = Function && Function->HasAnyFunctionFlags(FUNC_BlueprintCallable);
+		bool bIdentity = Function && Function->GetName() == Member && bCallable
+			&& bStatic == (CallMode == TEXT("static"));
+		UClass* LiveDeclaring = Function ? Function->GetOwnerClass() : nullptr;
+		UClass* LiveAuthoritative = LiveDeclaring ? LiveDeclaring->GetAuthoritativeClass() : nullptr;
+		bIdentity = bIdentity && LiveAuthoritative && LiveAuthoritative->GetPathName() == Owner;
+		if (bIdentity && LiveDeclaring && LiveDeclaring->GetPathName() != DeclaringOwner)
+		{
+			FGuid LiveGuid;
+			bIdentity = !BlueprintMemberGuid.IsEmpty() && DeclaringOwner.Contains(TEXT(".SKEL_"))
+				&& UBlueprint::GetGuidFromClassByFieldName<UFunction>(LiveDeclaring, Function->GetFName(), LiveGuid)
+				&& LiveGuid.ToString(EGuidFormats::Digits).Equals(BlueprintMemberGuid, ESearchCase::IgnoreCase);
+		}
+		if (bIdentity && !ExactFunctionParameters(Function, ExpectedParameters))
+		{
+			SetFailureResult(Result, TEXT("PREFLIGHT"), TEXT("SIGNATURE_MISMATCH"),
+				TEXT("live UFunction parameter signature differs from the catalog"));
+			bIdentity = false;
+		}
+		static const TArray<FString> DeniedMetadata = {
+			TEXT("Latent"), TEXT("WorldContext"), TEXT("DefaultToSelf"), TEXT("AutoCreateRefTerm"),
+			TEXT("ExpandEnumAsExecs"), TEXT("ExpandBoolAsExecs"), TEXT("DeterminesOutputType"),
+			TEXT("DynamicOutputParam"), TEXT("CustomStructureParam"), TEXT("ArrayParm"), TEXT("SetParam"),
+			TEXT("MapParam"), TEXT("CommutativeAssociativeBinaryOperator"), TEXT("CustomThunk"), TEXT("Variadic"),
+			TEXT("BlueprintInternalUseOnly"), TEXT("DeprecatedFunction") };
+		if (bIdentity) for (const FString& Key : DeniedMetadata) if (Function->HasMetaData(*Key))
+		{
+			SetFailureResult(Result, TEXT("ADMISSION"), TEXT("SPECIAL_FAMILY_REQUIRED"),
+				FString::Printf(TEXT("denied live metadata profile: %s"), *Key));
+			bIdentity = false;
+			break;
+		}
+		if (bIdentity) for (const auto& Pair : BehavioralMetadata->Values)
+			if (!Function->HasMetaData(*Pair.Key) || Function->GetMetaData(*Pair.Key) != Pair.Value->AsString())
+			{
+				SetFailureResult(Result, TEXT("PREFLIGHT"), TEXT("FUNCTION_RESOLUTION_MISMATCH"),
+					TEXT("live UFunction behavioral metadata differs from the catalog"));
+				bIdentity = false;
+				break;
+			}
+		if (!bIdentity)
+		{
+			if (!Result->HasField(TEXT("outcome"))) SetFailureResult(Result, TEXT("PREFLIGHT"),
+				TEXT("FUNCTION_RESOLUTION_MISMATCH"), TEXT("exact live UFunction identity is unavailable"));
+			Result->SetNumberField(TEXT("elapsed_ms"), (FPlatformTime::Seconds() - Started) * 1000.0);
+			Results.Add(MakeShared<FJsonValueObject>(Result));
+			continue;
+		}
+		Result->SetBoolField(TEXT("exact_function_resolved"), true);
+		TSharedPtr<FJsonObject> Flags = MakeShared<FJsonObject>();
+		Flags->SetBoolField(TEXT("blueprint_callable"), bCallable);
+		Flags->SetBoolField(TEXT("blueprint_pure"), Function->HasAnyFunctionFlags(FUNC_BlueprintPure));
+		Flags->SetBoolField(TEXT("const"), Function->HasAnyFunctionFlags(FUNC_Const));
+		Flags->SetBoolField(TEXT("static"), bStatic);
+		Result->SetObjectField(TEXT("function_flags"), Flags);
+
+		Graph->Modify(); Blueprint->Modify();
+		UK2Node_CallFunction* Call = NewObject<UK2Node_CallFunction>(Graph);
+		Call->NodeGuid = FGuid::NewGuid();
+		Call->SetFromFunction(Function);
+		Graph->AddNode(Call, false, false);
+		Call->AllocateDefaultPins();
+		Call->PostPlacedNewNode();
+		const bool bExactClass = Call->GetClass() == UK2Node_CallFunction::StaticClass()
+			&& Call->GetTargetFunction() == Function;
+		Result->SetBoolField(TEXT("exact_k2_class"), bExactClass);
+		bool bPins = bExactClass;
+		const bool bPure = Function->HasAnyFunctionFlags(FUNC_BlueprintPure);
+		const int32 ExpectedPinCount = ExpectedParameters->Num() + (bPure ? 0 : 2) + 1;
+		bPins = bPins && Call->Pins.Num() == ExpectedPinCount;
+		for (const TSharedPtr<FJsonValue>& ParameterValue : *ExpectedParameters)
+		{
+			const TSharedPtr<FJsonObject> Parameter = ParameterValue->AsObject();
+			const TSharedPtr<FJsonObject> ExpectedType = ObjectField(Parameter, TEXT("pin_type"));
+			FString Name, Direction;
+			UEdGraphPin* Match = nullptr;
+			if (!Parameter.IsValid() || !Parameter->TryGetStringField(TEXT("name"), Name)
+				|| !Parameter->TryGetStringField(TEXT("direction"), Direction)) { bPins = false; continue; }
+			const EEdGraphPinDirection PinDirection = Direction == TEXT("input") || Direction == TEXT("inout")
+				? EGPD_Input : EGPD_Output;
+			for (UEdGraphPin* Pin : Call->Pins) if (Pin && Pin->Direction == PinDirection && Pin->PinName.ToString() == Name)
+			{
+				if (Match) { Match = nullptr; break; }
+				Match = Pin;
+			}
+			if (!Match || !ExactExpectedPinType(ExpectedType, Match->PinType)) bPins = false;
+		}
+		Result->SetBoolField(TEXT("exact_pin_topology"), bPins);
+		TSharedPtr<FJsonObject> CompileEvidence;
+		const bool bCompiled = bPins && CompileWithoutSave(Blueprint, CompileEvidence);
+		Result->SetBoolField(TEXT("compile_succeeded"), bCompiled);
+		bool bTopologyComplete = false;
+		const TSharedPtr<FJsonObject> Topology = bCompiled ? SemanticTopologyV2(Graph, TEXT("graph"), bTopologyComplete) : nullptr;
+		bool bVerified = false;
+		if (bTopologyComplete && Topology.IsValid())
+		{
+			const FString Guid = NormalizeGuid(Call->NodeGuid.ToString(EGuidFormats::Digits));
+			if (const TArray<TSharedPtr<FJsonValue>>* Nodes = ArrayField(Topology, TEXT("nodes")))
+				for (const TSharedPtr<FJsonValue>& NodeValue : *Nodes)
+				{
+					const TSharedPtr<FJsonObject> Node = NodeValue->AsObject();
+					const TSharedPtr<FJsonObject> Reference = ObjectField(Node, TEXT("function_reference"));
+					if (Node.IsValid() && Reference.IsValid()
+						&& NormalizeGuid(Node->GetStringField(TEXT("existing_node_guid"))) == Guid
+						&& Node->GetStringField(TEXT("node_class")) == TEXT("K2Node_CallFunction")
+						&& Reference->GetStringField(TEXT("authoritative_owner")) == Owner
+						&& Reference->GetStringField(TEXT("native_member")) == Member) bVerified = true;
+				}
+		}
+		Result->SetBoolField(TEXT("semantic_verify_succeeded"), bVerified);
+		Graph->RemoveNode(Call);
+		Graph->NotifyGraphChanged();
+		bool bCleanupComplete = false;
+		const TSharedPtr<FJsonObject> Cleanup = SemanticTopologyV2(Graph, TEXT("graph"), bCleanupComplete);
+		Package->SetDirtyFlag(false);
+		const bool bCleanup = bCleanupComplete && Cleanup.IsValid()
+			&& CanonicalJsonObject(Cleanup) == BaselineCanonical && !Package->IsDirty();
+		Result->SetBoolField(TEXT("cleanup_succeeded"), bCleanup);
+		bBatchCleanup = bBatchCleanup && bCleanup;
+
+		const double ElapsedMs = (FPlatformTime::Seconds() - Started) * 1000.0;
+		if (ElapsedMs > TimeoutMs)
+			SetFailureResult(Result, TEXT("COMPILE"), TEXT("UNKNOWN"), TEXT("per-candidate timeout exceeded"));
+		else if (!bExactClass)
+			SetFailureResult(Result, TEXT("CONSTRUCTION"), TEXT("K2_CLASS_MISMATCH"), TEXT("ordinary CallFunction construction mismatch"));
+		else if (!bPins)
+			SetFailureResult(Result, TEXT("PIN_RECONSTRUCTION"), TEXT("SIGNATURE_MISMATCH"), TEXT("Unreal reconstructed unexpected pins"));
+		else if (!bCompiled)
+			SetFailureResult(Result, TEXT("COMPILE"), TEXT("COMPILE_FAILURE"), TEXT("candidate fixture compile failed"));
+		else if (!bVerified)
+			SetFailureResult(Result, TEXT("SEMANTIC_VERIFY"), TEXT("TOPOLOGY_MISMATCH"), TEXT("candidate topology identity mismatch"));
+		else if (!bCleanup)
+			SetFailureResult(Result, TEXT("ROLLBACK"), TEXT("ROLLBACK_FAILURE"), TEXT("candidate fixture cleanup mismatch"));
+		else
+		{
+			Result->SetStringField(TEXT("outcome"), TEXT("QUALIFIED"));
+			Result->SetStringField(TEXT("phase"), TEXT("COMPLETE"));
+		}
+		Result->SetNumberField(TEXT("elapsed_ms"), ElapsedMs);
+		Results.Add(MakeShared<FJsonValueObject>(Result));
+	}
+
+	TSharedPtr<FJsonObject> FinalCompile;
+	const bool bFinalCompiled = CompileWithoutSave(Blueprint, FinalCompile);
+	bool bFinalComplete = false;
+	const TSharedPtr<FJsonObject> FinalTopology = SemanticTopologyV2(Graph, TEXT("graph"), bFinalComplete);
+	Package->SetDirtyFlag(false);
+	bBatchCleanup = bBatchCleanup && bFinalCompiled && bFinalComplete && FinalTopology.IsValid()
+		&& CanonicalJsonObject(FinalTopology) == BaselineCanonical && !Package->IsDirty();
+	TSharedPtr<FJsonObject> Output = MakeShared<FJsonObject>();
+	Output->SetStringField(TEXT("harness_version"), HarnessVersion);
+	Output->SetStringField(TEXT("run_id"), RunId);
+	Output->SetStringField(TEXT("environment_id"), EnvironmentId);
+	Output->SetStringField(TEXT("fixture_path"), FixturePath);
+	Output->SetArrayField(TEXT("results"), Results);
+	Output->SetBoolField(TEXT("batch_cleanup_succeeded"), bBatchCleanup);
+	Output->SetBoolField(TEXT("package_clean"), !Package->IsDirty());
+	Output->SetBoolField(TEXT("save_performed"), false);
+	return MCPResult(Output);
 }
