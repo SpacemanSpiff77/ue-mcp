@@ -810,8 +810,10 @@ void FMCPBridgeServer::ProcessWebSocketMessages(int32 ClientSocketFD)
 #endif
 {
 	constexpr int32 RecvBufferSize = 65536;
+	constexpr uint64 MaxRequestFrameSize = 64ull * 1024ull * 1024ull;
 	TArray<uint8> Buffer;
 	Buffer.SetNumUninitialized(RecvBufferSize);
+	TArray<uint8> PendingData;
 
 	while (!bShouldStop)
 	{
@@ -833,20 +835,53 @@ void FMCPBridgeServer::ProcessWebSocketMessages(int32 ClientSocketFD)
 				break;
 			}
 
-			TArray<uint8> FrameData(Buffer.GetData(), BytesReceived);
-			FString Message = ParseWebSocketFrame(FrameData);
-			
-			if (!Message.IsEmpty())
+			PendingData.Append(Buffer.GetData(), BytesReceived);
+			while (PendingData.Num() >= 2)
 			{
-				FString Response = ProcessMessage(Message);
-				TArray<uint8> ResponseFrame = CreateWebSocketFrame(Response);
-				int32 TotalToSend = ResponseFrame.Num();
-				int32 Sent = 0;
-				while (Sent < TotalToSend)
+				const uint8 LengthCode = PendingData[1] & 0x7F;
+				int32 HeaderLen = 2;
+				uint64 PayloadLen = LengthCode;
+				if (LengthCode == 126)
 				{
-					int32 BytesSent = send(ClientSocketFD, (char*)ResponseFrame.GetData() + Sent, TotalToSend - Sent, 0);
-					if (BytesSent <= 0) break;
-					Sent += BytesSent;
+					if (PendingData.Num() < 4) break;
+					PayloadLen = (static_cast<uint64>(PendingData[2]) << 8) | PendingData[3];
+					HeaderLen = 4;
+				}
+				else if (LengthCode == 127)
+				{
+					if (PendingData.Num() < 10) break;
+					PayloadLen = 0;
+					for (int32 Index = 0; Index < 8; ++Index)
+					{
+						PayloadLen = (PayloadLen << 8) | PendingData[2 + Index];
+					}
+					HeaderLen = 10;
+				}
+				if ((PendingData[1] & 0x80) != 0) HeaderLen += 4;
+				if (PayloadLen > MaxRequestFrameSize)
+				{
+					UE_LOG(LogMCPBridge, Error, TEXT("[UE-MCP] WebSocket request frame exceeded the 64 MiB limit"));
+					return;
+				}
+				const uint64 TotalFrameSize = static_cast<uint64>(HeaderLen) + PayloadLen;
+				if (static_cast<uint64>(PendingData.Num()) < TotalFrameSize) break;
+
+				TArray<uint8> FrameData;
+				FrameData.Append(PendingData.GetData(), static_cast<int32>(TotalFrameSize));
+				PendingData.RemoveAt(0, static_cast<int32>(TotalFrameSize), EAllowShrinking::No);
+				FString Message = ParseWebSocketFrame(FrameData);
+				if (!Message.IsEmpty())
+				{
+					FString Response = ProcessMessage(Message);
+					TArray<uint8> ResponseFrame = CreateWebSocketFrame(Response);
+					int32 TotalToSend = ResponseFrame.Num();
+					int32 Sent = 0;
+					while (Sent < TotalToSend)
+					{
+						int32 BytesSent = send(ClientSocketFD, (char*)ResponseFrame.GetData() + Sent, TotalToSend - Sent, 0);
+						if (BytesSent <= 0) break;
+						Sent += BytesSent;
+					}
 				}
 			}
 		}
