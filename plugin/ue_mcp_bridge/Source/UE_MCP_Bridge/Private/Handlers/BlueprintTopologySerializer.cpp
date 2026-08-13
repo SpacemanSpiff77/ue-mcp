@@ -268,6 +268,16 @@ UE_MCP_BlueprintTopology::FSerializedGraphTopology UE_MCP_BlueprintTopology::Ser
 		else if (UK2Node_CallFunction* Call = Cast<UK2Node_CallFunction>(Node))
 		{
 			WriteMemberReference(Call->FunctionReference, TEXT("calledFunction"), NodeJson, SemanticIdentity);
+			if (UFunction* Function = Call->GetTargetFunction())
+			{
+				TSharedPtr<FJsonObject> Called = NodeJson->GetObjectField(TEXT("calledFunction"));
+				UClass* Declaring = Function->GetOwnerClass();
+				UClass* Authoritative = Declaring ? Declaring->GetAuthoritativeClass() : nullptr;
+				Called->SetStringField(TEXT("nativeMember"), Function->GetName());
+				Called->SetStringField(TEXT("declaringOwner"), Declaring ? Declaring->GetPathName() : FString());
+				Called->SetStringField(TEXT("authoritativeOwner"), Authoritative ? Authoritative->GetPathName() : FString());
+				Called->SetStringField(TEXT("callMode"), Function->HasAnyFunctionFlags(FUNC_Static) ? TEXT("static") : TEXT("instance"));
+			}
 		}
 		else if (UK2Node_MacroInstance* Macro = Cast<UK2Node_MacroInstance>(Node))
 		{
