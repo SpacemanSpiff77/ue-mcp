@@ -40,6 +40,7 @@ namespace
 	const TCHAR* OperationVersion = TEXT("graph.set-pin-default@1.0");
 	const TCHAR* HandlerVersion = TEXT("spacehead.graph.set-pin-default-handler@1.0");
 	const TCHAR* TopologyVersion = TEXT("spacehead.blueprint-semantic-topology@1.0");
+	const TCHAR* TopologyV2Version = TEXT("spacehead.blueprint-semantic-topology@2.0");
 	const TCHAR* UeMcpVersion = TEXT("1.1.36");
 	const TCHAR* BridgeVersion = TEXT("0.3.0");
 	const TCHAR* InputSchemaVersion = TEXT("spacehead.blueprint-atomic-bridge.request@2.0");
@@ -498,6 +499,159 @@ namespace
 		return Result;
 	}
 
+	TSharedPtr<FJsonObject> SemanticTopologyV2(UEdGraph* Graph, const FString& GraphType, bool& bComplete)
+	{
+		UE_MCP_BlueprintTopology::FGraphSerializationOptions Options;
+		Options.GraphIdentity = Graph->GetPathName();
+		Options.NormalizedGraphType = GraphType;
+		Options.FunctionName = GraphType == TEXT("function") ? Graph->GetName() : FString();
+		Options.bIncludeFullBlueprintMetadata = true;
+		Options.bRejectDuplicateNodeScopedPinIdentity = true;
+		const UE_MCP_BlueprintTopology::FSerializedGraphTopology Serialized =
+			UE_MCP_BlueprintTopology::SerializeGraph(Graph, Options);
+		bComplete = Serialized.IsComplete();
+		if (!bComplete || !Serialized.Graph.IsValid()) return nullptr;
+
+		auto ReferenceV2 = [](const TSharedPtr<FJsonObject>& Source)
+		{
+			TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+			Result->SetStringField(TEXT("owner"), Source->GetStringField(TEXT("owner")));
+			Result->SetStringField(TEXT("name"), Source->GetStringField(TEXT("name")));
+			Result->SetStringField(TEXT("guid"), Source->GetStringField(TEXT("memberGuid")));
+			Result->SetBoolField(TEXT("self_context"), Source->GetBoolField(TEXT("selfContext")));
+			return Result;
+		};
+		auto TypeMemberV2 = [](const TSharedPtr<FJsonObject>& Source)
+		{
+			TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+			Result->SetStringField(TEXT("owner"), Source->GetStringField(TEXT("memberParent")));
+			Result->SetStringField(TEXT("name"), Source->GetStringField(TEXT("memberName")));
+			Result->SetStringField(TEXT("guid"), Source->GetStringField(TEXT("memberGuid")));
+			return Result;
+		};
+		auto TerminalV2 = [](const TSharedPtr<FJsonObject>& Source)
+		{
+			TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+			Result->SetStringField(TEXT("category"), Source->GetStringField(TEXT("category")));
+			Result->SetStringField(TEXT("subcategory"), Source->GetStringField(TEXT("subCategory")));
+			Result->SetStringField(TEXT("subcategory_object"), Source->GetStringField(TEXT("subCategoryObject")));
+			Result->SetBoolField(TEXT("is_const"), Source->GetBoolField(TEXT("isConst")));
+			Result->SetBoolField(TEXT("is_weak_reference"), Source->GetBoolField(TEXT("isWeakPointer")));
+			Result->SetBoolField(TEXT("is_uobject_wrapper"), Source->GetBoolField(TEXT("isUObjectWrapper")));
+			return Result;
+		};
+
+		TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+		Result->SetStringField(TEXT("topology_version"), TopologyV2Version);
+		TSharedPtr<FJsonObject> GraphJson = MakeShared<FJsonObject>();
+		GraphJson->SetStringField(TEXT("graph_identity"), Serialized.Graph->GetStringField(TEXT("graphIdentity")));
+		GraphJson->SetStringField(TEXT("graph_guid"), Serialized.Graph->GetStringField(TEXT("graphGuid")));
+		GraphJson->SetStringField(TEXT("graph_name"), Serialized.Graph->GetStringField(TEXT("graphName")));
+		GraphJson->SetStringField(TEXT("graph_type"), Serialized.Graph->GetStringField(TEXT("graphType")));
+		GraphJson->SetStringField(TEXT("schema_class"), Serialized.Graph->GetStringField(TEXT("schemaClass")));
+		Result->SetObjectField(TEXT("graph"), GraphJson);
+
+		TArray<TSharedPtr<FJsonValue>> Nodes;
+		const TArray<TSharedPtr<FJsonValue>>* SourceNodes = ArrayField(Serialized.Graph, TEXT("nodes"));
+		if (!SourceNodes) return nullptr;
+		for (const TSharedPtr<FJsonValue>& SourceValue : *SourceNodes)
+		{
+			const TSharedPtr<FJsonObject> Source = SourceValue->AsObject();
+			if (!Source.IsValid()) return nullptr;
+			TSharedPtr<FJsonObject> Node = MakeShared<FJsonObject>();
+			Node->SetStringField(TEXT("node_id"), Source->GetStringField(TEXT("id")));
+			Node->SetStringField(TEXT("existing_node_guid"), Source->GetStringField(TEXT("nodeGuid")));
+			Node->SetStringField(TEXT("node_class"), Source->GetStringField(TEXT("nodeClass")));
+			Node->SetStringField(TEXT("semantic_type"), Source->GetStringField(TEXT("kind")));
+			Node->SetObjectField(TEXT("semantic_properties"), MakeShared<FJsonObject>());
+			if (const TSharedPtr<FJsonObject> Variable = ObjectField(Source, TEXT("variable")))
+			{
+				TSharedPtr<FJsonObject> Reference = MakeShared<FJsonObject>();
+				Reference->SetStringField(TEXT("owner"), Variable->GetStringField(TEXT("owner")));
+				Reference->SetStringField(TEXT("name"), Variable->GetStringField(TEXT("name")));
+				Reference->SetStringField(TEXT("guid"), Variable->GetStringField(TEXT("memberGuid")));
+				Reference->SetBoolField(TEXT("self_context"), Variable->GetBoolField(TEXT("selfContext")));
+				Node->SetObjectField(TEXT("member_reference"), Reference);
+			}
+			if (const TSharedPtr<FJsonObject> Called = ObjectField(Source, TEXT("calledFunction")))
+			{
+				Node->SetObjectField(TEXT("function_reference"), ReferenceV2(Called));
+				Node->SetStringField(TEXT("call_mode"), Called->GetBoolField(TEXT("selfContext"))
+					? TEXT("self-context") : TEXT("external-context"));
+			}
+
+			TArray<TSharedPtr<FJsonValue>> Pins;
+			const TArray<TSharedPtr<FJsonValue>>* SourcePins = ArrayField(Source, TEXT("pins"));
+			if (!SourcePins) return nullptr;
+			for (const TSharedPtr<FJsonValue>& PinValue : *SourcePins)
+			{
+				const TSharedPtr<FJsonObject> SourcePin = PinValue->AsObject();
+				const TSharedPtr<FJsonObject> SourceType = ObjectField(SourcePin, TEXT("typeInfo"));
+				const TSharedPtr<FJsonObject> SourceMember = ObjectField(SourceType, TEXT("subCategoryMemberReference"));
+				const TSharedPtr<FJsonObject> SourceTerminal = ObjectField(SourceType, TEXT("valueTerminalType"));
+				if (!SourcePin.IsValid() || !SourceType.IsValid() || !SourceMember.IsValid() || !SourceTerminal.IsValid())
+					return nullptr;
+				TSharedPtr<FJsonObject> Pin = MakeShared<FJsonObject>();
+				Pin->SetStringField(TEXT("pin_id"), SourcePin->GetStringField(TEXT("id")));
+				Pin->SetStringField(TEXT("role"), SourcePin->GetStringField(TEXT("classification")));
+				Pin->SetStringField(TEXT("name"), SourcePin->GetStringField(TEXT("name")));
+				Pin->SetStringField(TEXT("direction"), SourcePin->GetStringField(TEXT("direction")));
+				TSharedPtr<FJsonObject> Type = MakeShared<FJsonObject>();
+				Type->SetStringField(TEXT("category"), SourceType->GetStringField(TEXT("category")));
+				Type->SetStringField(TEXT("subcategory"), SourceType->GetStringField(TEXT("subCategory")));
+				Type->SetStringField(TEXT("subcategory_object"), SourceType->GetStringField(TEXT("subCategoryObject")));
+				Type->SetObjectField(TEXT("subcategory_member_reference"), TypeMemberV2(SourceMember));
+				const FString Container = SourceType->GetStringField(TEXT("containerType"));
+				Type->SetStringField(TEXT("container"), Container == TEXT("none") ? TEXT("scalar") : Container);
+				Type->SetObjectField(TEXT("value_terminal_type"), TerminalV2(SourceTerminal));
+				Type->SetBoolField(TEXT("is_reference"), SourceType->GetBoolField(TEXT("isReference")));
+				Type->SetBoolField(TEXT("is_const"), SourceType->GetBoolField(TEXT("isConst")));
+				Type->SetBoolField(TEXT("is_weak_reference"), SourceType->GetBoolField(TEXT("isWeakPointer")));
+				Type->SetBoolField(TEXT("is_uobject_wrapper"), SourceType->GetBoolField(TEXT("isUObjectWrapper")));
+				Type->SetBoolField(TEXT("serialize_as_single_precision_float"),
+					SourceType->GetBoolField(TEXT("serializeAsSinglePrecisionFloat")));
+				Pin->SetObjectField(TEXT("type"), Type);
+				Pin->SetStringField(TEXT("default_value"), SourcePin->GetStringField(TEXT("defaultValue")));
+				Pin->SetStringField(TEXT("default_object"), SourcePin->GetStringField(TEXT("defaultObject")));
+				Pin->SetStringField(TEXT("default_text"), SourcePin->GetStringField(TEXT("defaultTextValue")));
+				Pins.Add(MakeShared<FJsonValueObject>(Pin));
+			}
+			Pins.Sort([](const TSharedPtr<FJsonValue>& A, const TSharedPtr<FJsonValue>& B)
+			{
+				return A->AsObject()->GetStringField(TEXT("pin_id")) < B->AsObject()->GetStringField(TEXT("pin_id"));
+			});
+			Node->SetArrayField(TEXT("pins"), Pins);
+			Nodes.Add(MakeShared<FJsonValueObject>(Node));
+		}
+		Nodes.Sort([](const TSharedPtr<FJsonValue>& A, const TSharedPtr<FJsonValue>& B)
+		{
+			return A->AsObject()->GetStringField(TEXT("node_id")) < B->AsObject()->GetStringField(TEXT("node_id"));
+		});
+		Result->SetArrayField(TEXT("nodes"), Nodes);
+
+		TArray<TSharedPtr<FJsonValue>> Connections;
+		const TArray<TSharedPtr<FJsonValue>>* SourceConnections = ArrayField(Serialized.Graph, TEXT("connections"));
+		if (!SourceConnections) return nullptr;
+		for (const TSharedPtr<FJsonValue>& SourceValue : *SourceConnections)
+		{
+			const TSharedPtr<FJsonObject> Source = SourceValue->AsObject();
+			if (!Source.IsValid()) return nullptr;
+			TSharedPtr<FJsonObject> Connection = MakeShared<FJsonObject>();
+			Connection->SetStringField(TEXT("from_node_id"), Source->GetStringField(TEXT("sourceNodeId")));
+			Connection->SetStringField(TEXT("from_pin_id"), Source->GetStringField(TEXT("sourcePinId")));
+			Connection->SetStringField(TEXT("to_node_id"), Source->GetStringField(TEXT("targetNodeId")));
+			Connection->SetStringField(TEXT("to_pin_id"), Source->GetStringField(TEXT("targetPinId")));
+			Connection->SetStringField(TEXT("classification"), Source->GetStringField(TEXT("classification")));
+			Connections.Add(MakeShared<FJsonValueObject>(Connection));
+		}
+		Connections.Sort([](const TSharedPtr<FJsonValue>& A, const TSharedPtr<FJsonValue>& B)
+		{
+			return CanonicalJsonObject(A->AsObject()) < CanonicalJsonObject(B->AsObject());
+		});
+		Result->SetArrayField(TEXT("connections"), Connections);
+		return Result;
+	}
+
 	UEdGraphNode* ResolveNode(UEdGraph* Graph, const FString& Guid)
 	{
 		UEdGraphNode* Match = nullptr;
@@ -793,7 +947,9 @@ namespace
 	TSharedPtr<FJsonObject> CanonicalizeFixtureTopology(const TSharedPtr<FJsonObject>& Source)
 	{
 		TSharedPtr<FJsonObject> Result = CloneObject(Source);
-		if (!Result.IsValid() || Result->GetStringField(TEXT("topology_version")) != TopologyVersion) return nullptr;
+		if (!Result.IsValid()) return nullptr;
+		const FString Version = Result->GetStringField(TEXT("topology_version"));
+		if (Version != TopologyVersion && Version != TopologyV2Version) return nullptr;
 		Result->RemoveField(TEXT("layout"));
 		const TArray<TSharedPtr<FJsonValue>>* SourceNodes = ArrayField(Result, TEXT("nodes"));
 		const TArray<TSharedPtr<FJsonValue>>* SourceConnections = ArrayField(Result, TEXT("connections"));
@@ -854,9 +1010,15 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		const TArray<TSharedPtr<FJsonValue>>* Vectors = ArrayField(Params, TEXT("vectors"));
 		if (!Vectors || Vectors->Num() < 1 || Vectors->Num() > 16) return MCPError(TEXT("INVALID_CANONICAL_VECTOR_SET"));
 		TArray<TSharedPtr<FJsonValue>> Results;
+		FString RequestedTopologyVersion;
 		for (const TSharedPtr<FJsonValue>& Value : *Vectors)
 		{
-			const TSharedPtr<FJsonObject> Canonical = CanonicalizeFixtureTopology(Value->AsObject());
+			const TSharedPtr<FJsonObject> Source = Value->AsObject();
+			if (!Source.IsValid()) return MCPError(TEXT("INVALID_CANONICAL_TOPOLOGY_VECTOR"));
+			const FString Version = Source->GetStringField(TEXT("topology_version"));
+			if (RequestedTopologyVersion.IsEmpty()) RequestedTopologyVersion = Version;
+			if (Version != RequestedTopologyVersion) return MCPError(TEXT("MIXED_CANONICAL_TOPOLOGY_VERSIONS"));
+			const TSharedPtr<FJsonObject> Canonical = CanonicalizeFixtureTopology(Source);
 			if (!Canonical.IsValid()) return MCPError(TEXT("INVALID_CANONICAL_TOPOLOGY_VECTOR"));
 			const FString Text = CanonicalJsonObject(Canonical);
 			TSharedPtr<FJsonObject> VectorResult = MakeShared<FJsonObject>();
@@ -865,7 +1027,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			Results.Add(MakeShared<FJsonValueObject>(VectorResult));
 		}
 		TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
-		Result->SetStringField(TEXT("topology_version"), TopologyVersion);
+		Result->SetStringField(TEXT("topology_version"), RequestedTopologyVersion);
 		Result->SetArrayField(TEXT("vectors"), Results);
 		return MCPResult(Result);
 	}
@@ -1073,8 +1235,11 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		const bool bDirtyBefore = Package && Package->IsDirty();
 		bool bPreComplete = false;
 		const TSharedPtr<FJsonObject> PreTopology = Graph ? SemanticTopology(Graph, GraphType, bPreComplete) : nullptr;
+		bool bPreV2Complete = false;
+		const TSharedPtr<FJsonObject> PreTopologyV2 = Graph ? SemanticTopologyV2(Graph, GraphType, bPreV2Complete) : nullptr;
 		const bool bPreflightSucceeded = Blueprint && Graph && Package && Cast<UEdGraphSchema_K2>(Schema)
-			&& !bDirtyBefore && bPreComplete && CanonicalJsonObject(PreTopology) == CanonicalJsonObject(BaselineTopology);
+			&& !bDirtyBefore && bPreComplete && bPreV2Complete
+			&& CanonicalJsonObject(PreTopology) == CanonicalJsonObject(BaselineTopology);
 		TSharedPtr<FJsonObject> DirtyState = MakeShared<FJsonObject>();
 		DirtyState->SetBoolField(TEXT("before"), bDirtyBefore);
 		DirtyState->SetBoolField(TEXT("after_preflight"), Package && Package->IsDirty());
@@ -1086,6 +1251,9 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		PreflightEvidence->SetStringField(TEXT("topology_version"), TopologyVersion);
 		Evidence->SetObjectField(TEXT("preflight"), PreflightEvidence);
 		Evidence->SetStringField(TEXT("pre_semantic_fingerprint"), bPreComplete ? Sha256(CanonicalJsonObject(PreTopology)) : FString());
+		Evidence->SetStringField(TEXT("semantic_topology_v2_version"), TopologyV2Version);
+		Evidence->SetStringField(TEXT("pre_semantic_fingerprint_v2"),
+			bPreV2Complete ? Sha256(CanonicalJsonObject(PreTopologyV2)) : FString());
 		if (!bPreflightSucceeded)
 		{
 			SetFailure(Receipt, TEXT("LIVE_PREFLIGHT"), TEXT("STALE_PLAN_OR_TARGET_MISMATCH"), TEXT("FAILED_PRE_MUTATION"),
@@ -1418,10 +1586,14 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 
 		bool bPostComplete = false;
 		const TSharedPtr<FJsonObject> PostTopology = SemanticTopology(Graph, GraphType, bPostComplete);
+		bool bPostV2Complete = false;
+		const TSharedPtr<FJsonObject> PostTopologyV2 = SemanticTopologyV2(Graph, GraphType, bPostV2Complete);
 		const FString PostFingerprint = bPostComplete ? Sha256(CanonicalJsonObject(PostTopology)) : FString();
 		Evidence->SetStringField(TEXT("post_semantic_fingerprint"), PostFingerprint);
+		Evidence->SetStringField(TEXT("post_semantic_fingerprint_v2"),
+			bPostV2Complete ? Sha256(CanonicalJsonObject(PostTopologyV2)) : FString());
 		const TSharedPtr<FJsonObject> CanonicalExpectedPost = CanonicalizeFixtureTopology(ExpectedPost);
-		bool bVerified = bPostComplete && CanonicalExpectedPost.IsValid()
+		bool bVerified = bPostComplete && bPostV2Complete && CanonicalExpectedPost.IsValid()
 			&& CanonicalJsonObject(PostTopology) == CanonicalJsonObject(CanonicalExpectedPost)
 			&& FaultCheckpoint != TEXT("VERIFICATION_FAILURE");
 		const TArray<TSharedPtr<FJsonValue>>* BaselineNodes = ArrayField(BaselineTopology, TEXT("nodes"));
@@ -1455,8 +1627,13 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		if (!bSaved) return RollbackWholeBuild(TEXT("SAVE"), TEXT("BLUEPRINT_SAVE_FAILED"), FailingOperation, true);
 		bool bPersistedComplete = false;
 		const TSharedPtr<FJsonObject> PersistedTopology = SemanticTopology(Graph, GraphType, bPersistedComplete);
-		const bool bPersisted = bPersistedComplete && !Package->IsDirty()
-			&& CanonicalJsonObject(PersistedTopology) == CanonicalJsonObject(PostTopology);
+		bool bPersistedV2Complete = false;
+		const TSharedPtr<FJsonObject> PersistedTopologyV2 = SemanticTopologyV2(Graph, GraphType, bPersistedV2Complete);
+		Evidence->SetStringField(TEXT("persisted_semantic_fingerprint_v2"),
+			bPersistedV2Complete ? Sha256(CanonicalJsonObject(PersistedTopologyV2)) : FString());
+		const bool bPersisted = bPersistedComplete && bPersistedV2Complete && !Package->IsDirty()
+			&& CanonicalJsonObject(PersistedTopology) == CanonicalJsonObject(PostTopology)
+			&& CanonicalJsonObject(PersistedTopologyV2) == CanonicalJsonObject(PostTopologyV2);
 		SaveEvidence->SetBoolField(TEXT("persisted_verified"), bPersisted);
 		SaveEvidence->SetBoolField(TEXT("package_clean"), !Package->IsDirty());
 		DirtyState->SetBoolField(TEXT("final"), Package->IsDirty());
@@ -1637,6 +1814,8 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		bool bPreComplete = false;
 		const FString GraphType = BaselineTopology->GetObjectField(TEXT("graph"))->GetStringField(TEXT("graph_type"));
 		TSharedPtr<FJsonObject> PreTopology = Graph ? SemanticTopology(Graph, GraphType, bPreComplete) : nullptr;
+		bool bPreV2Complete = false;
+		const TSharedPtr<FJsonObject> PreTopologyV2 = Graph ? SemanticTopologyV2(Graph, GraphType, bPreV2Complete) : nullptr;
 		const bool bDirtyAfterPreflight = Package && Package->IsDirty();
 
 		FString CreatedNodeGuid;
@@ -1773,7 +1952,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			ExpectedPost->SetArrayField(TEXT("connections"), UpdatedConnections);
 		}
 
-		const bool bPreflightSucceeded = Blueprint && Graph && Package && Schema && bPreComplete
+		const bool bPreflightSucceeded = Blueprint && Graph && Package && Schema && bPreComplete && bPreV2Complete
 			&& !bDirtyBefore && !bDirtyAfterPreflight && bOperationPreflight
 			&& CanonicalJsonObject(PreTopology) == CanonicalJsonObject(BaselineTopology);
 		TSharedPtr<FJsonObject> DirtyState = MakeShared<FJsonObject>();
@@ -1787,6 +1966,9 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		PreflightEvidence->SetStringField(TEXT("topology_version"), TopologyVersion);
 		Evidence->SetObjectField(TEXT("preflight"), PreflightEvidence);
 		Evidence->SetStringField(TEXT("pre_semantic_fingerprint"), bPreComplete ? Sha256(CanonicalJsonObject(PreTopology)) : FString());
+		Evidence->SetStringField(TEXT("semantic_topology_v2_version"), TopologyV2Version);
+		Evidence->SetStringField(TEXT("pre_semantic_fingerprint_v2"),
+			bPreV2Complete ? Sha256(CanonicalJsonObject(PreTopologyV2)) : FString());
 		if (!bPreflightSucceeded)
 		{
 			SetFailure(Receipt, TEXT("LIVE_PREFLIGHT"), TEXT("STALE_PLAN_OR_UNSUPPORTED_GRAPH_BEHAVIOR"), TEXT("FAILED_PRE_MUTATION"),
@@ -1998,10 +2180,14 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 
 		bool bPostComplete = false;
 		const TSharedPtr<FJsonObject> PostTopology = SemanticTopology(Graph, GraphType, bPostComplete);
+		bool bPostV2Complete = false;
+		const TSharedPtr<FJsonObject> PostTopologyV2 = SemanticTopologyV2(Graph, GraphType, bPostV2Complete);
 		const FString PostFingerprint = bPostComplete ? Sha256(CanonicalJsonObject(PostTopology)) : FString();
 		Evidence->SetStringField(TEXT("post_semantic_fingerprint"), PostFingerprint);
+		Evidence->SetStringField(TEXT("post_semantic_fingerprint_v2"),
+			bPostV2Complete ? Sha256(CanonicalJsonObject(PostTopologyV2)) : FString());
 		const bool bForcedVerifyFailure = FaultCheckpoint == TEXT("VERIFICATION_FAILURE");
-		const bool bVerified = !bForcedVerifyFailure && bPostComplete
+		const bool bVerified = !bForcedVerifyFailure && bPostComplete && bPostV2Complete
 			&& (StageBOperation == EStageBOperation::AddNode
 				? VerifyAddedNode(PostTopology)
 				: CanonicalJsonObject(PostTopology) == CanonicalJsonObject(ExpectedPost));
@@ -2038,10 +2224,15 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 
 		bool bPersistedComplete = false;
 		const TSharedPtr<FJsonObject> PersistedTopology = SemanticTopology(Graph, GraphType, bPersistedComplete);
-		const bool bPersisted = bPersistedComplete && !Package->IsDirty()
+		bool bPersistedV2Complete = false;
+		const TSharedPtr<FJsonObject> PersistedTopologyV2 = SemanticTopologyV2(Graph, GraphType, bPersistedV2Complete);
+		Evidence->SetStringField(TEXT("persisted_semantic_fingerprint_v2"),
+			bPersistedV2Complete ? Sha256(CanonicalJsonObject(PersistedTopologyV2)) : FString());
+		const bool bPersisted = bPersistedComplete && bPersistedV2Complete && !Package->IsDirty()
 			&& (StageBOperation == EStageBOperation::AddNode
 				? VerifyAddedNode(PersistedTopology)
-				: CanonicalJsonObject(PersistedTopology) == CanonicalJsonObject(ExpectedPost));
+				: CanonicalJsonObject(PersistedTopology) == CanonicalJsonObject(ExpectedPost))
+			&& CanonicalJsonObject(PersistedTopologyV2) == CanonicalJsonObject(PostTopologyV2);
 		SaveEvidence->SetBoolField(TEXT("persisted_verified"), bPersisted);
 		SaveEvidence->SetBoolField(TEXT("package_clean"), !Package->IsDirty());
 		DirtyState->SetBoolField(TEXT("final"), Package->IsDirty());
@@ -2202,14 +2393,16 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 	UPackage* Package = Blueprint ? Blueprint->GetOutermost() : nullptr;
 	const bool bDirtyBefore = Package && Package->IsDirty();
 	bool bPreComplete = false;
-	TSharedPtr<FJsonObject> PreTopology = Graph ? SemanticTopology(Graph,
-		BaselineTopology->GetObjectField(TEXT("graph"))->GetStringField(TEXT("graph_type")), bPreComplete) : nullptr;
+	const FString GraphType = BaselineTopology->GetObjectField(TEXT("graph"))->GetStringField(TEXT("graph_type"));
+	TSharedPtr<FJsonObject> PreTopology = Graph ? SemanticTopology(Graph, GraphType, bPreComplete) : nullptr;
+	bool bPreV2Complete = false;
+	const TSharedPtr<FJsonObject> PreTopologyV2 = Graph ? SemanticTopologyV2(Graph, GraphType, bPreV2Complete) : nullptr;
 	const bool bDirtyAfterPreflight = Package && Package->IsDirty();
 	UEdGraphNode* Node = Graph ? ResolveNode(Graph, NodeGuid) : nullptr;
 	UEdGraphPin* Pin = Node ? ResolvePin(Node, PinId, PinName) : nullptr;
 	const FString ExpectedDefault = bExpected ? TEXT("true") : TEXT("false");
 	const FString DesiredDefault = bDesired ? TEXT("true") : TEXT("false");
-	const bool bPreflight = Blueprint && Graph && Package && Node && Pin && bPreComplete
+	const bool bPreflight = Blueprint && Graph && Package && Node && Pin && bPreComplete && bPreV2Complete
 		&& !bDirtyBefore && !bDirtyAfterPreflight
 		&& Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Boolean
 		&& Pin->PinType.ContainerType == EPinContainerType::None
@@ -2227,6 +2420,9 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 	Preflight->SetStringField(TEXT("topology_version"), TopologyVersion);
 	Evidence->SetObjectField(TEXT("preflight"), Preflight);
 	Evidence->SetStringField(TEXT("pre_semantic_fingerprint"), bPreComplete ? Sha256(CanonicalJsonObject(PreTopology)) : FString());
+	Evidence->SetStringField(TEXT("semantic_topology_v2_version"), TopologyV2Version);
+	Evidence->SetStringField(TEXT("pre_semantic_fingerprint_v2"),
+		bPreV2Complete ? Sha256(CanonicalJsonObject(PreTopologyV2)) : FString());
 	if (!bPreflight)
 	{
 		SetFailure(Receipt, TEXT("LIVE_PREFLIGHT"), TEXT("STALE_PLAN_OR_TARGET_MISMATCH"), TEXT("FAILED_PRE_MUTATION"), TEXT("Live Unreal preflight did not exactly match the BuildPlan"));
@@ -2333,12 +2529,15 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 	}
 
 	bool bPostComplete = false;
-	const TSharedPtr<FJsonObject> PostTopology = SemanticTopology(Graph,
-		BaselineTopology->GetObjectField(TEXT("graph"))->GetStringField(TEXT("graph_type")), bPostComplete);
+	const TSharedPtr<FJsonObject> PostTopology = SemanticTopology(Graph, GraphType, bPostComplete);
+	bool bPostV2Complete = false;
+	const TSharedPtr<FJsonObject> PostTopologyV2 = SemanticTopologyV2(Graph, GraphType, bPostV2Complete);
 	const FString PostFingerprint = bPostComplete ? Sha256(CanonicalJsonObject(PostTopology)) : FString();
 	Evidence->SetStringField(TEXT("post_semantic_fingerprint"), PostFingerprint);
+	Evidence->SetStringField(TEXT("post_semantic_fingerprint_v2"),
+		bPostV2Complete ? Sha256(CanonicalJsonObject(PostTopologyV2)) : FString());
 	const bool bForcedVerifyFailure = FaultCheckpoint == TEXT("VERIFICATION_FAILURE");
-	const bool bVerified = !bForcedVerifyFailure && bPostComplete
+	const bool bVerified = !bForcedVerifyFailure && bPostComplete && bPostV2Complete
 		&& CanonicalJsonObject(PostTopology) == CanonicalJsonObject(ExpectedPost);
 	TSharedPtr<FJsonObject> Verification = Attempt(true, bVerified);
 	Verification->SetBoolField(TEXT("exact_expected_delta"), bVerified);
@@ -2371,10 +2570,14 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 	if (!bSaved) return Rollback(TEXT("SAVE"), TEXT("BLUEPRINT_SAVE_FAILED"), true);
 
 	bool bPersistedComplete = false;
-	const TSharedPtr<FJsonObject> PersistedTopology = SemanticTopology(Graph,
-		BaselineTopology->GetObjectField(TEXT("graph"))->GetStringField(TEXT("graph_type")), bPersistedComplete);
-	const bool bPersisted = bPersistedComplete && !Package->IsDirty()
-		&& CanonicalJsonObject(PersistedTopology) == CanonicalJsonObject(ExpectedPost);
+	const TSharedPtr<FJsonObject> PersistedTopology = SemanticTopology(Graph, GraphType, bPersistedComplete);
+	bool bPersistedV2Complete = false;
+	const TSharedPtr<FJsonObject> PersistedTopologyV2 = SemanticTopologyV2(Graph, GraphType, bPersistedV2Complete);
+	Evidence->SetStringField(TEXT("persisted_semantic_fingerprint_v2"),
+		bPersistedV2Complete ? Sha256(CanonicalJsonObject(PersistedTopologyV2)) : FString());
+	const bool bPersisted = bPersistedComplete && bPersistedV2Complete && !Package->IsDirty()
+		&& CanonicalJsonObject(PersistedTopology) == CanonicalJsonObject(ExpectedPost)
+		&& CanonicalJsonObject(PersistedTopologyV2) == CanonicalJsonObject(PostTopologyV2);
 	SaveEvidence->SetBoolField(TEXT("persisted_verified"), bPersisted);
 	SaveEvidence->SetBoolField(TEXT("package_clean"), !Package->IsDirty());
 	DirtyState->SetBoolField(TEXT("final"), Package->IsDirty());
