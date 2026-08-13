@@ -3175,9 +3175,11 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::QualifyCallFunctionCandidates(const T
 		const TSharedPtr<FJsonObject> Candidate = CandidateValue->AsObject();
 		TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 		FString CandidateId, Owner, DeclaringOwner, Member, CallMode, ExpectedSpawner, ExpectedNode;
-		FString SignatureDigest, MetadataDigest, BlueprintMemberGuid;
+		FString SignatureDigest, MetadataDigest, BlueprintMemberGuid, ClassificationState;
 		double TimeoutMs = 0;
 		const TArray<TSharedPtr<FJsonValue>>* ExpectedParameters = ArrayField(Candidate, TEXT("expected_parameters"));
+		const TArray<TSharedPtr<FJsonValue>>* ClassificationReasons = ArrayField(Candidate, TEXT("classification_reasons"));
+		const TArray<TSharedPtr<FJsonValue>>* PinTypeProfile = ArrayField(Candidate, TEXT("pin_type_profile"));
 		const TSharedPtr<FJsonObject> BehavioralMetadata = ObjectField(Candidate, TEXT("behavioral_metadata"));
 		const bool bShape = Candidate.IsValid()
 			&& Candidate->TryGetStringField(TEXT("candidate_id"), CandidateId) && ValidHash(CandidateId)
@@ -3193,8 +3195,11 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::QualifyCallFunctionCandidates(const T
 			&& ExpectedNode == TEXT("/Script/BlueprintGraph.K2Node_CallFunction")
 			&& Candidate->TryGetStringField(TEXT("signature_digest"), SignatureDigest) && ValidHash(SignatureDigest)
 			&& Candidate->TryGetStringField(TEXT("metadata_digest"), MetadataDigest) && ValidHash(MetadataDigest)
+			&& Candidate->TryGetStringField(TEXT("classification_state"), ClassificationState)
+			&& (ClassificationState == TEXT("STANDARD_CALL") || ClassificationState == TEXT("STANDARD_WITH_CONSTRAINTS"))
 			&& Candidate->TryGetNumberField(TEXT("per_candidate_timeout_ms"), TimeoutMs)
-			&& TimeoutMs >= 100 && TimeoutMs <= 120000 && ExpectedParameters && BehavioralMetadata.IsValid();
+			&& TimeoutMs >= 100 && TimeoutMs <= 120000 && ExpectedParameters && ClassificationReasons
+			&& PinTypeProfile && BehavioralMetadata.IsValid();
 		Result->SetStringField(TEXT("candidate_id"), CandidateId);
 		Result->SetBoolField(TEXT("exact_function_resolved"), false);
 		Result->SetBoolField(TEXT("exact_k2_class"), false);
@@ -3212,6 +3217,23 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::QualifyCallFunctionCandidates(const T
 		}
 		PreviousCandidate = CandidateId;
 		Candidate->TryGetStringField(TEXT("blueprint_member_guid"), BlueprintMemberGuid);
+		bool bAdmissionProfile = ClassificationState == TEXT("STANDARD_CALL") && ClassificationReasons->IsEmpty();
+		if (ClassificationState == TEXT("STANDARD_WITH_CONSTRAINTS") && ClassificationReasons->Num() == 1)
+			bAdmissionProfile = (*ClassificationReasons)[0]->AsString() == TEXT("required_parameters");
+		static const TSet<FString> FixedProfiles = { TEXT("bool"), TEXT("byte"), TEXT("enum"), TEXT("int"),
+			TEXT("int64"), TEXT("float"), TEXT("double"), TEXT("name"), TEXT("string"), TEXT("object"),
+			TEXT("class"), TEXT("interface"), TEXT("vector"), TEXT("rotator"), TEXT("transform"),
+			TEXT("ordinary_struct"), TEXT("out") };
+		for (const TSharedPtr<FJsonValue>& Profile : *PinTypeProfile)
+			if (!FixedProfiles.Contains(Profile->AsString())) bAdmissionProfile = false;
+		if (!bAdmissionProfile)
+		{
+			SetFailureResult(Result, TEXT("ADMISSION"), TEXT("SPECIAL_FAMILY_REQUIRED"),
+				TEXT("candidate is outside the fixed CallFunction v1 admission profile"));
+			Result->SetNumberField(TEXT("elapsed_ms"), (FPlatformTime::Seconds() - Started) * 1000.0);
+			Results.Add(MakeShared<FJsonValueObject>(Result));
+			continue;
+		}
 
 		UClass* OwnerClass = FindObject<UClass>(nullptr, *Owner);
 		if (!OwnerClass) OwnerClass = LoadObject<UClass>(nullptr, *Owner);
