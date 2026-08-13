@@ -15,6 +15,7 @@ describe("CallFunction Pass 4 qualification bridge", () => {
     expect(qualification).toContain("Candidates->Num() > 500");
     expect(qualification).toContain("/Game/Tests/Builder/");
     expect(qualification).toContain("spacehead.call-function-qualification-harness@1.0");
+    expect(qualification).toContain('DeclaringOwner.Contains(TEXT(".SKEL_")) && BlueprintMemberGuid.IsEmpty()');
   });
 
   it("constructs ordinary native nodes, compiles without save, verifies topology v2, and restores the fixture", () => {

@@ -3220,6 +3220,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::QualifyCallFunctionCandidates(const T
 		bool bAdmissionProfile = ClassificationState == TEXT("STANDARD_CALL") && ClassificationReasons->IsEmpty();
 		if (ClassificationState == TEXT("STANDARD_WITH_CONSTRAINTS") && ClassificationReasons->Num() == 1)
 			bAdmissionProfile = (*ClassificationReasons)[0]->AsString() == TEXT("required_parameters");
+		if (DeclaringOwner.Contains(TEXT(".SKEL_")) && BlueprintMemberGuid.IsEmpty()) bAdmissionProfile = false;
 		static const TSet<FString> FixedProfiles = { TEXT("bool"), TEXT("byte"), TEXT("enum"), TEXT("int"),
 			TEXT("int64"), TEXT("float"), TEXT("double"), TEXT("name"), TEXT("string"), TEXT("object"),
 			TEXT("class"), TEXT("interface"), TEXT("vector"), TEXT("rotator"), TEXT("transform"),
