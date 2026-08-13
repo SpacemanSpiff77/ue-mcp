@@ -42,7 +42,8 @@ namespace BlueprintActionDiscovery
 	struct FActionRecord
 	{
 		FString SortKey;
-		TSharedPtr<FJsonObject> Json;
+		const UObject* ActionOwner = nullptr;
+		const UBlueprintNodeSpawner* Spawner = nullptr;
 	};
 
 	static FString ObjectPath(const UObject* Object)
@@ -261,6 +262,67 @@ namespace BlueprintActionDiscovery
 			if (Value.Contains(Query, ESearchCase::IgnoreCase)) return true;
 		return false;
 	}
+
+	static TSharedPtr<FJsonObject> SerializeAction(
+		const UObject* ActionOwner,
+		const UBlueprintNodeSpawner* Spawner,
+		const TArray<FContextProfile>& Contexts,
+		const bool bIncludeTemplateEvidence)
+	{
+		FBlueprintActionInfo Info(ActionOwner, Spawner);
+		const FFieldVariant AssociatedField = Info.GetAssociatedMemberField();
+		const UFunction* Function = Info.GetAssociatedFunction();
+		const FProperty* Property = Info.GetAssociatedProperty();
+		const FString ActionOwnerPath = ActionOwner->GetPathName();
+		const FBlueprintNodeSignature Signature = Spawner->GetSpawnerSignature();
+		TSharedPtr<FJsonObject> Action = MakeShared<FJsonObject>();
+		Action->SetStringField(TEXT("action_owner"), ActionOwnerPath);
+		Action->SetStringField(TEXT("action_owner_class"), ActionOwner->GetClass()->GetPathName());
+		Action->SetStringField(TEXT("spawner_class"), Spawner->GetClass()->GetPathName());
+		Action->SetStringField(TEXT("k2_node_class"), Spawner->NodeClass->GetPathName());
+		Action->SetStringField(TEXT("associated_field_kind"), Function ? TEXT("function") : Property ? TEXT("property")
+			: AssociatedField.IsValid() ? TEXT("field") : TEXT("none"));
+		Action->SetStringField(TEXT("associated_field_path"), FieldPath(AssociatedField));
+		Action->SetStringField(TEXT("spawner_signature"), Signature.ToString());
+		Action->SetStringField(TEXT("spawner_signature_guid"), Signature.AsGuid().ToString(EGuidFormats::Digits));
+		FBlueprintActionContext UiContext;
+		if (Contexts.Num() > 0)
+		{
+			UiContext.Blueprints.Add(Contexts[0].Blueprint);
+			UiContext.Graphs.Add(Contexts[0].Graph);
+		}
+		const FBlueprintActionUiSpec Ui = Contexts.Num() > 0
+			? Spawner->GetUiSpec(UiContext, Info.GetBindings()) : Spawner->PrimeDefaultUiSpec();
+		Action->SetStringField(TEXT("display_name"), Ui.MenuName.ToString());
+		Action->SetStringField(TEXT("category"), Ui.Category.ToString());
+		if (Function) Action->SetObjectField(TEXT("function"), SerializeFunction(Function));
+		if (Property)
+		{
+			TSharedPtr<FJsonObject> PropertyJson = SerializeProperty(Property, nullptr, 0);
+			UStruct* DeclaringStruct = Property->GetOwnerStruct();
+			UClass* DeclaringClass = Cast<UClass>(DeclaringStruct);
+			PropertyJson->SetStringField(TEXT("path"), Property->GetPathName());
+			PropertyJson->SetStringField(TEXT("declaring_owner"), ObjectPath(DeclaringStruct));
+			PropertyJson->SetStringField(TEXT("authoritative_owner"), ObjectPath(DeclaringClass ? DeclaringClass->GetAuthoritativeClass() : DeclaringStruct));
+			PropertyJson->SetStringField(TEXT("blueprint_member_guid"), GuidForMember(FFieldVariant(const_cast<FProperty*>(Property)), DeclaringClass));
+			PropertyJson->SetStringField(TEXT("module_or_plugin"), ModuleProvenance(DeclaringStruct));
+			Action->SetObjectField(TEXT("property"), PropertyJson);
+		}
+		AddContextAvailability(Action, ActionOwner, Spawner, Contexts);
+		if (bIncludeTemplateEvidence)
+		{
+			UEdGraph* TargetGraph = Contexts.Num() > 0 ? Contexts[0].Graph : nullptr;
+			UEdGraphNode* Template = Spawner->GetTemplateNode(TargetGraph);
+			TSharedPtr<FJsonObject> TemplateEvidence = MakeShared<FJsonObject>();
+			TemplateEvidence->SetBoolField(TEXT("available"), Template != nullptr);
+			TemplateEvidence->SetStringField(TEXT("node_class"), Template ? Template->GetClass()->GetPathName() : FString());
+			TemplateEvidence->SetStringField(TEXT("outer_class"), Template && Template->GetOuter() ? Template->GetOuter()->GetClass()->GetPathName() : FString());
+			TemplateEvidence->SetBoolField(TEXT("outer_transient"), Template && Template->GetOutermost() == GetTransientPackage());
+			TemplateEvidence->SetNumberField(TEXT("pin_count"), Template ? Template->Pins.Num() : 0);
+			Action->SetObjectField(TEXT("template_evidence"), TemplateEvidence);
+		}
+		return Action;
+	}
 }
 
 TSharedPtr<FJsonValue> FBlueprintHandlers::DiscoverBlueprintActions(const TSharedPtr<FJsonObject>& Params)
@@ -325,56 +387,10 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::DiscoverBlueprintActions(const TShare
 				Function ? Function->GetName() : FString(), Property ? Property->GetName() : FString() })) continue;
 
 			const FBlueprintNodeSignature Signature = Spawner->GetSpawnerSignature();
-			TSharedPtr<FJsonObject> Action = MakeShared<FJsonObject>();
-			Action->SetStringField(TEXT("action_owner"), ActionOwnerPath);
-			Action->SetStringField(TEXT("action_owner_class"), ActionOwner->GetClass()->GetPathName());
-			Action->SetStringField(TEXT("spawner_class"), SpawnerClassPath);
-			Action->SetStringField(TEXT("k2_node_class"), NodeClassPath);
-			Action->SetStringField(TEXT("associated_field_kind"), Function ? TEXT("function") : Property ? TEXT("property")
-				: AssociatedField.IsValid() ? TEXT("field") : TEXT("none"));
-			Action->SetStringField(TEXT("associated_field_path"), AssociatedPath);
-			Action->SetStringField(TEXT("spawner_signature"), Signature.ToString());
-			Action->SetStringField(TEXT("spawner_signature_guid"), Signature.AsGuid().ToString(EGuidFormats::Digits));
-			FBlueprintActionContext UiContext;
-			if (Contexts.Num() > 0)
-			{
-				UiContext.Blueprints.Add(Contexts[0].Blueprint);
-				UiContext.Graphs.Add(Contexts[0].Graph);
-			}
-			const FBlueprintActionUiSpec Ui = Contexts.Num() > 0
-				? Spawner->GetUiSpec(UiContext, Info.GetBindings()) : Spawner->PrimeDefaultUiSpec();
-			Action->SetStringField(TEXT("display_name"), Ui.MenuName.ToString());
-			Action->SetStringField(TEXT("category"), Ui.Category.ToString());
-			if (Function) Action->SetObjectField(TEXT("function"), SerializeFunction(Function));
-			if (Property)
-			{
-				TSharedPtr<FJsonObject> PropertyJson = SerializeProperty(Property, nullptr, 0);
-				UStruct* DeclaringStruct = Property->GetOwnerStruct();
-				UClass* DeclaringClass = Cast<UClass>(DeclaringStruct);
-				PropertyJson->SetStringField(TEXT("path"), Property->GetPathName());
-				PropertyJson->SetStringField(TEXT("declaring_owner"), ObjectPath(DeclaringStruct));
-				PropertyJson->SetStringField(TEXT("authoritative_owner"), ObjectPath(DeclaringClass ? DeclaringClass->GetAuthoritativeClass() : DeclaringStruct));
-				PropertyJson->SetStringField(TEXT("blueprint_member_guid"), GuidForMember(FFieldVariant(const_cast<FProperty*>(Property)), DeclaringClass));
-				PropertyJson->SetStringField(TEXT("module_or_plugin"), ModuleProvenance(DeclaringStruct));
-				Action->SetObjectField(TEXT("property"), PropertyJson);
-			}
-			AddContextAvailability(Action, ActionOwner, Spawner, Contexts);
-			if (bIncludeTemplateEvidence)
-			{
-				UEdGraph* TargetGraph = Contexts.Num() > 0 ? Contexts[0].Graph : nullptr;
-				UEdGraphNode* Template = Spawner->GetTemplateNode(TargetGraph);
-				TSharedPtr<FJsonObject> TemplateEvidence = MakeShared<FJsonObject>();
-				TemplateEvidence->SetBoolField(TEXT("available"), Template != nullptr);
-				TemplateEvidence->SetStringField(TEXT("node_class"), Template ? Template->GetClass()->GetPathName() : FString());
-				TemplateEvidence->SetStringField(TEXT("outer_class"), Template && Template->GetOuter() ? Template->GetOuter()->GetClass()->GetPathName() : FString());
-				TemplateEvidence->SetBoolField(TEXT("outer_transient"), Template && Template->GetOutermost() == GetTransientPackage());
-				TemplateEvidence->SetNumberField(TEXT("pin_count"), Template ? Template->Pins.Num() : 0);
-				Action->SetObjectField(TEXT("template_evidence"), TemplateEvidence);
-			}
 			const TArray<FString> SortParts = { ActionOwnerPath, SpawnerClassPath, NodeClassPath, AssociatedPath,
 				Signature.ToString() };
 			const FString SortKey = FString::Join(SortParts, TEXT("\x1f"));
-			Records.Add({ SortKey, Action });
+			Records.Add({ SortKey, ActionOwner, Spawner });
 		}
 	}
 	Records.Sort([](const FActionRecord& A, const FActionRecord& B) { return A.SortKey < B.SortKey; });
@@ -382,7 +398,8 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::DiscoverBlueprintActions(const TShare
 	TArray<TSharedPtr<FJsonValue>> Actions;
 	const int32 End = FMath::Min(Records.Num(), Offset + Limit);
 	for (int32 Index = FMath::Min(Offset, Records.Num()); Index < End; ++Index)
-		Actions.Add(MakeShared<FJsonValueObject>(Records[Index].Json));
+		Actions.Add(MakeShared<FJsonValueObject>(SerializeAction(
+			Records[Index].ActionOwner, Records[Index].Spawner, Contexts, bIncludeTemplateEvidence)));
 	TArray<TSharedPtr<FJsonValue>> ContextEvidence;
 	bool bPersistentMutationObserved = false;
 	for (const FContextProfile& Profile : Contexts)
