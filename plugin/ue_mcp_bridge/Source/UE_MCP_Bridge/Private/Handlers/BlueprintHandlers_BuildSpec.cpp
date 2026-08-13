@@ -3302,8 +3302,9 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::QualifyCallFunctionCandidates(const T
 		Graph->AddNode(Call, false, false);
 		Call->AllocateDefaultPins();
 		Call->PostPlacedNewNode();
+		UFunction* ConstructedFunction = Call->GetTargetFunction();
 		const bool bExactClass = Call->GetClass() == UK2Node_CallFunction::StaticClass()
-			&& Call->GetTargetFunction() == Function;
+			&& ConstructedFunction && ConstructedFunction->GetName() == Function->GetName();
 		Result->SetBoolField(TEXT("exact_k2_class"), bExactClass);
 		bool bPins = bExactClass;
 		const bool bPure = Function->HasAnyFunctionFlags(FUNC_BlueprintPure);
