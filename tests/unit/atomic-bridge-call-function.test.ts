@@ -58,7 +58,7 @@ describe("atomic Builder CallFunction.Standard", () => {
   });
 
   it("accepts only direct schema connections and reports conversion-required distinctly", () => {
-    expect(handler).toContain("CompatibilityResponse == CONNECT_RESPONSE_MAKE");
+    expect(handler).toContain("CompatibilityResponse.Response == CONNECT_RESPONSE_MAKE");
     expect(handler).toContain('TEXT("UNQUALIFIED_CONVERSION_REQUIRED")');
     expect(handler).not.toContain("CreateAutomaticConversionNodeAndConnections");
   });

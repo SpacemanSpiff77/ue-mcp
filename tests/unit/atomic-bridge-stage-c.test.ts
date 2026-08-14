@@ -30,8 +30,8 @@ describe("atomic Builder Stage C bounded multi-operation contract", () => {
     expect(handler).toContain("ResolveSemanticPin");
     expect(handler).toContain('TEXT("Condition"), EGPD_Input, TEXT("bool")');
     expect(handler).toContain('TEXT("then"), EGPD_Output, TEXT("exec")');
-    expect(handler).not.toContain("CONNECT_RESPONSE_MAKE_WITH_CONVERSION_NODE");
-    expect(handler).not.toContain("CONNECT_RESPONSE_MAKE_WITH_PROMOTION");
+    expect(handler).not.toContain("CreateAutomaticConversionNodeAndConnections");
+    expect(handler).not.toContain("CreatePromotedConnection");
   });
 
   it("exposes middle-operation and lost-response qualification checkpoints", () => {

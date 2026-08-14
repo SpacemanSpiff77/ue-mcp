@@ -24,8 +24,8 @@ describe("atomic Builder Stage B minimum graph vocabulary", () => {
     expect(handler).toContain("Response.Response == CONNECT_RESPONSE_MAKE");
     expect(handler).toContain("Schema->TryCreateConnection(FromPin, ToPin)");
     expect(handler).toContain("Schema->BreakSinglePinLink(FromPin, ToPin)");
-    expect(handler).not.toContain("CONNECT_RESPONSE_MAKE_WITH_CONVERSION_NODE");
-    expect(handler).not.toContain("CONNECT_RESPONSE_MAKE_WITH_PROMOTION");
+    expect(handler).not.toContain("CreateAutomaticConversionNodeAndConnections");
+    expect(handler).not.toContain("CreatePromotedConnection");
   });
 
   it("restores add/connect/disconnect explicitly and proves the complete canonical baseline", () => {

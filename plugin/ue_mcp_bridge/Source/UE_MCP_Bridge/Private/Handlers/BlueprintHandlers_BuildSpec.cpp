@@ -726,6 +726,148 @@ namespace
 		}
 	}
 
+	FString ConnectionResponseName(ECanCreateConnectionResponse Response)
+	{
+		switch (Response)
+		{
+		case CONNECT_RESPONSE_MAKE: return TEXT("CONNECT_RESPONSE_MAKE");
+		case CONNECT_RESPONSE_DISALLOW: return TEXT("CONNECT_RESPONSE_DISALLOW");
+		case CONNECT_RESPONSE_BREAK_OTHERS_A: return TEXT("CONNECT_RESPONSE_BREAK_OTHERS_A");
+		case CONNECT_RESPONSE_BREAK_OTHERS_B: return TEXT("CONNECT_RESPONSE_BREAK_OTHERS_B");
+		case CONNECT_RESPONSE_BREAK_OTHERS_AB: return TEXT("CONNECT_RESPONSE_BREAK_OTHERS_AB");
+		case CONNECT_RESPONSE_MAKE_WITH_CONVERSION_NODE: return TEXT("CONNECT_RESPONSE_MAKE_WITH_CONVERSION_NODE");
+		case CONNECT_RESPONSE_MAKE_WITH_PROMOTION: return TEXT("CONNECT_RESPONSE_MAKE_WITH_PROMOTION");
+		case CONNECT_RESPONSE_MAX: return TEXT("CONNECT_RESPONSE_MAX");
+		default: return TEXT("CONNECT_RESPONSE_UNKNOWN");
+		}
+	}
+
+	FString ConnectionDiagnosticCode(ECanCreateConnectionResponse Response)
+	{
+		switch (Response)
+		{
+		case CONNECT_RESPONSE_MAKE: return TEXT("DIRECT_SCHEMA_MAKE");
+		case CONNECT_RESPONSE_DISALLOW: return TEXT("SCHEMA_DISALLOW");
+		case CONNECT_RESPONSE_BREAK_OTHERS_A:
+		case CONNECT_RESPONSE_BREAK_OTHERS_B:
+		case CONNECT_RESPONSE_BREAK_OTHERS_AB: return TEXT("BREAK_EXISTING_REQUIRED");
+		case CONNECT_RESPONSE_MAKE_WITH_CONVERSION_NODE: return TEXT("CONVERSION_REQUIRED");
+		case CONNECT_RESPONSE_MAKE_WITH_PROMOTION: return TEXT("PROMOTION_REQUIRED");
+		default: return TEXT("SCHEMA_RESPONSE_UNKNOWN");
+		}
+	}
+
+	TSharedPtr<FJsonObject> StructuralPinTypeEvidence(const UEdGraphPin* Pin)
+	{
+		const FEdGraphPinType Empty;
+		const FEdGraphPinType& Type = Pin ? Pin->PinType : Empty;
+		TSharedPtr<FJsonObject> Terminal = MakeShared<FJsonObject>();
+		Terminal->SetStringField(TEXT("category"), Type.PinValueType.TerminalCategory.ToString());
+		Terminal->SetStringField(TEXT("subcategory"), Type.PinValueType.TerminalSubCategory.ToString());
+		Terminal->SetStringField(TEXT("subcategory_object"), PinObjectPath(Type.PinValueType.TerminalSubCategoryObject));
+		Terminal->SetBoolField(TEXT("const"), Type.PinValueType.bTerminalIsConst);
+		Terminal->SetBoolField(TEXT("weak_reference"), Type.PinValueType.bTerminalIsWeakPointer);
+		Terminal->SetBoolField(TEXT("uobject_wrapper"), Type.PinValueType.bTerminalIsUObjectWrapper);
+		TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+		Result->SetStringField(TEXT("category"), Type.PinCategory.ToString().ToLower());
+		Result->SetStringField(TEXT("subcategory"), Type.PinSubCategory.ToString());
+		Result->SetStringField(TEXT("subcategory_object"), PinObjectPath(Type.PinSubCategoryObject));
+		Result->SetStringField(TEXT("container"), PinContainerName(Type.ContainerType));
+		Result->SetBoolField(TEXT("reference"), Type.bIsReference);
+		Result->SetBoolField(TEXT("const"), Type.bIsConst);
+		Result->SetBoolField(TEXT("weak_reference"), Type.bIsWeakPointer);
+		Result->SetBoolField(TEXT("uobject_wrapper"), Type.bIsUObjectWrapper);
+		Result->SetObjectField(TEXT("map_value_type"), Terminal);
+		return Result;
+	}
+
+	bool ExactStructuralPinType(const UEdGraphPin* A, const UEdGraphPin* B)
+	{
+		return A && B && CanonicalJsonObject(StructuralPinTypeEvidence(A))
+			== CanonicalJsonObject(StructuralPinTypeEvidence(B));
+	}
+
+	FString PinClassification(const UEdGraphPin* Pin)
+	{
+		return Pin && Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec
+			? TEXT("execution") : TEXT("data");
+	}
+
+	TSharedPtr<FJsonObject> ConnectionPinEvidence(const UEdGraphPin* Pin, int32 PreLinkCount)
+	{
+		const UEdGraphNode* Node = Pin ? Pin->GetOwningNodeUnchecked() : nullptr;
+		TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+		Result->SetStringField(TEXT("node_identity"), Node
+			? Node->NodeGuid.ToString(EGuidFormats::DigitsWithHyphensLower) : FString());
+		Result->SetStringField(TEXT("pin_identity"), Pin
+			? Pin->PinId.ToString(EGuidFormats::DigitsWithHyphensLower) : FString());
+		Result->SetStringField(TEXT("pin_name"), Pin ? Pin->PinName.ToString() : FString());
+		Result->SetStringField(TEXT("direction"), Pin && Pin->Direction == EGPD_Output ? TEXT("output") : TEXT("input"));
+		Result->SetStringField(TEXT("classification"), PinClassification(Pin));
+		Result->SetObjectField(TEXT("pin_type"), StructuralPinTypeEvidence(Pin));
+		Result->SetBoolField(TEXT("pre_linked"), PreLinkCount > 0);
+		Result->SetNumberField(TEXT("pre_link_count"), PreLinkCount);
+		return Result;
+	}
+
+	TSharedPtr<FJsonObject> ConnectionDecisionEvidence(
+		const FString& OperationId,
+		const UEdGraphSchema* Schema,
+		const FPinConnectionResponse& Response,
+		const UEdGraphPin* FromPin,
+		const UEdGraphPin* ToPin,
+		int32 FromPreLinkCount,
+		int32 ToPreLinkCount,
+		bool bTryAttempted,
+		bool bTrySucceeded,
+		bool bReciprocalVerified)
+	{
+		const UEdGraphNode* FromNode = FromPin ? FromPin->GetOwningNodeUnchecked() : nullptr;
+		const UEdGraphNode* ToNode = ToPin ? ToPin->GetOwningNodeUnchecked() : nullptr;
+		const bool bStructural = FromPin && ToPin && FromNode && ToNode && FromNode != ToNode
+			&& FromPin->Direction == EGPD_Output && ToPin->Direction == EGPD_Input
+			&& PinClassification(FromPin) == PinClassification(ToPin)
+			&& ExactStructuralPinType(FromPin, ToPin);
+		const bool bPinsClean = FromPin && ToPin && FromPreLinkCount == 0 && ToPreLinkCount == 0;
+		TArray<TSharedPtr<FJsonValue>> RejectionReasons;
+		auto Reject = [&](const TCHAR* Code) { RejectionReasons.Add(MakeShared<FJsonValueString>(Code)); };
+		if (!FromPin || !ToPin) Reject(TEXT("PIN_RESOLUTION_FAILED"));
+		if (FromNode && ToNode && FromNode == ToNode) Reject(TEXT("SAME_NODE"));
+		if (!bStructural) Reject(TEXT("STRUCTURAL_PROFILE_MISMATCH"));
+		if (!bPinsClean) Reject(TEXT("PINS_NOT_CLEAN"));
+		if (Response.Response != CONNECT_RESPONSE_MAKE) Reject(*ConnectionDiagnosticCode(Response.Response.GetValue()));
+		if (Response.Response == CONNECT_RESPONSE_MAKE && !bTryAttempted) Reject(TEXT("TRY_CREATE_CONNECTION_NOT_ATTEMPTED"));
+		if (bTryAttempted && !bTrySucceeded) Reject(TEXT("TRY_CREATE_CONNECTION_FAILED"));
+		if (bTrySucceeded && !bReciprocalVerified) Reject(TEXT("RECIPROCAL_TOPOLOGY_NOT_VERIFIED"));
+		const bool bQualified = bStructural && Response.Response == CONNECT_RESPONSE_MAKE
+			&& bTryAttempted && bTrySucceeded && bReciprocalVerified;
+		FString Diagnostic = Response.Message.ToString().Left(256);
+		Diagnostic.ReplaceInline(TEXT("\r"), TEXT(" "));
+		Diagnostic.ReplaceInline(TEXT("\n"), TEXT(" "));
+		Diagnostic.ReplaceInline(TEXT("\t"), TEXT(" "));
+		TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+		Result->SetStringField(TEXT("evidence_version"), TEXT("spacehead.connection-decision-evidence@1.0"));
+		Result->SetStringField(TEXT("profile"), TEXT("direct_exact_v1"));
+		Result->SetStringField(TEXT("operation_id"), OperationId);
+		Result->SetStringField(TEXT("schema_class"), Schema ? Schema->GetClass()->GetPathName() : FString());
+		Result->SetStringField(TEXT("unreal_response_enum"), ConnectionResponseName(Response.Response.GetValue()));
+		Result->SetNumberField(TEXT("unreal_response_code"), static_cast<int32>(Response.Response.GetValue()));
+		Result->SetBoolField(TEXT("fatal"), Response.IsFatal());
+		Result->SetStringField(TEXT("diagnostic_code"), ConnectionDiagnosticCode(Response.Response.GetValue()));
+		Result->SetStringField(TEXT("diagnostic_text"), Diagnostic);
+		Result->SetObjectField(TEXT("from"), ConnectionPinEvidence(FromPin, FromPreLinkCount));
+		Result->SetObjectField(TEXT("to"), ConnectionPinEvidence(ToPin, ToPreLinkCount));
+		Result->SetBoolField(TEXT("structural_profile_match"), bStructural);
+		Result->SetBoolField(TEXT("pins_clean"), bPinsClean);
+		Result->SetBoolField(TEXT("try_create_connection_attempted"), bTryAttempted);
+		Result->SetBoolField(TEXT("try_create_connection_succeeded"), bTrySucceeded);
+		Result->SetBoolField(TEXT("reciprocal_topology_verified"), bReciprocalVerified);
+		Result->SetStringField(TEXT("outcome"), bQualified ? TEXT("QUALIFIED") : TEXT("REJECTED"));
+		Result->SetBoolField(TEXT("qualified"), bQualified);
+		Result->SetArrayField(TEXT("rejection_reason_codes"), RejectionReasons);
+		return Result;
+	}
+
 	bool ExactExpectedPinType(const TSharedPtr<FJsonObject>& Expected, const FEdGraphPinType& Actual)
 	{
 		if (!Expected.IsValid()) return false;
@@ -1568,6 +1710,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		TArray<FAppliedOperation> Applied;
 		TMap<FString, UEdGraphNode*> LogicalNodes;
 		TArray<TSharedPtr<FJsonValue>> PerOperationResults;
+		TArray<TSharedPtr<FJsonValue>> ConnectionDecisions;
 		TSharedPtr<FJsonObject> ExpectedPost = CloneObject(BaselineTopology);
 		TSharedPtr<FJsonObject> ExpectedPostV2 = CloneObject(PreTopologyV2);
 
@@ -1742,6 +1885,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			FString SpecKind, SpecVersionValue;
 			FString FailureDetail;
 			bool bSucceeded = false, bMutationOccurred = false;
+			TSharedPtr<FJsonObject> ConnectionDecision;
 			if (!Operation.IsValid() || !Payload.IsValid()
 				|| !Operation->TryGetStringField(TEXT("operation_id"), OperationId)
 				|| !Operation->TryGetStringField(TEXT("operation_version"), Version)
@@ -1995,15 +2139,23 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 				UEdGraphPin* ToPin = To.IsValid() && To->TryGetStringField(TEXT("pin_name"), ToName)
 					&& To->TryGetStringField(TEXT("category"), ToCategory)
 					? ResolveSemanticPin(ToNode, ToName, EGPD_Input, ToCategory, ToId) : nullptr;
+				const int32 FromPreLinkCount = FromPin ? FromPin->LinkedTo.Num() : 0;
+				const int32 ToPreLinkCount = ToPin ? ToPin->LinkedTo.Num() : 0;
 				const bool bConnected = FromPin && ToPin && FromPin->LinkedTo.Contains(ToPin) && ToPin->LinkedTo.Contains(FromPin);
-				ECanCreateConnectionResponse CompatibilityResponse = CONNECT_RESPONSE_DISALLOW;
-				if (FromPin && ToPin) CompatibilityResponse = Schema->CanCreateConnection(FromPin, ToPin).Response.GetValue();
+				FPinConnectionResponse CompatibilityResponse(CONNECT_RESPONSE_DISALLOW, FText::GetEmpty());
+				if (FromPin && ToPin) CompatibilityResponse = Schema->CanCreateConnection(FromPin, ToPin);
+				bool bTryAttempted = false;
+				bool bTrySucceeded = false;
+				bool bReciprocalVerified = false;
 				if (Version == TEXT("graph.connect-pins@1.0") && FromPin && ToPin && FromNode != ToNode
 					&& FromCategory.Equals(ToCategory, ESearchCase::IgnoreCase) && !bConnected
 					&& FromPin->LinkedTo.IsEmpty() && ToPin->LinkedTo.IsEmpty()
-					&& CompatibilityResponse == CONNECT_RESPONSE_MAKE)
+					&& CompatibilityResponse.Response == CONNECT_RESPONSE_MAKE)
 				{
-					bSucceeded = Schema->TryCreateConnection(FromPin, ToPin); bMutationOccurred = bSucceeded;
+					bTryAttempted = true;
+					bTrySucceeded = Schema->TryCreateConnection(FromPin, ToPin);
+					bReciprocalVerified = bTrySucceeded && FromPin->LinkedTo.Contains(ToPin) && ToPin->LinkedTo.Contains(FromPin);
+					bSucceeded = bTrySucceeded && bReciprocalVerified; bMutationOccurred = bSucceeded;
 					if (bSucceeded) Applied.Add({ EAppliedKind::Connected, OperationId, nullptr, FromPin, ToPin });
 				}
 				else if (Version == TEXT("graph.disconnect-pins@1.0") && bConnected)
@@ -2011,8 +2163,16 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 					Schema->BreakSinglePinLink(FromPin, ToPin); bSucceeded = true; bMutationOccurred = true;
 					Applied.Add({ EAppliedKind::Disconnected, OperationId, nullptr, FromPin, ToPin });
 				}
+				if (Version == TEXT("graph.connect-pins@1.0"))
+				{
+					ConnectionDecision = ConnectionDecisionEvidence(OperationId, Schema, CompatibilityResponse,
+						FromPin, ToPin, FromPreLinkCount, ToPreLinkCount,
+						bTryAttempted, bTrySucceeded, bReciprocalVerified);
+					ConnectionDecisions.Add(MakeShared<FJsonValueObject>(ConnectionDecision));
+					Evidence->SetArrayField(TEXT("connection_decisions"), ConnectionDecisions);
+				}
 				if (!bSucceeded) FailureCode = Version == TEXT("graph.connect-pins@1.0")
-					&& FromPin && ToPin && CompatibilityResponse != CONNECT_RESPONSE_MAKE
+					&& FromPin && ToPin && CompatibilityResponse.Response != CONNECT_RESPONSE_MAKE
 					? TEXT("UNQUALIFIED_CONVERSION_REQUIRED")
 					: Version == TEXT("graph.connect-pins@1.0") ? TEXT("CONNECT_PINS_FAILED") : TEXT("DISCONNECT_PINS_FAILED");
 				if (bSucceeded)
@@ -2060,6 +2220,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			Result->SetStringField(TEXT("operation_type"), Version);
 			Result->SetBoolField(TEXT("succeeded"), bSucceeded);
 			Result->SetBoolField(TEXT("mutation_occurred"), bMutationOccurred);
+			if (ConnectionDecision.IsValid()) Result->SetObjectField(TEXT("connection_decision"), ConnectionDecision);
 			if (!bSucceeded) Result->SetStringField(TEXT("failure_code"), FailureCode);
 			if (!FailureDetail.IsEmpty()) Result->SetStringField(TEXT("failure_detail"), FailureDetail);
 			PerOperationResults.Add(MakeShared<FJsonValueObject>(Result));
@@ -2380,6 +2541,10 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		UEdGraphNode* AddedNode = nullptr;
 		TSharedPtr<FJsonObject> ExpectedPost = CloneObject(BaselineTopology);
 		bool bOperationPreflight = false;
+		FPinConnectionResponse DirectConnectionResponse(CONNECT_RESPONSE_DISALLOW, FText::GetEmpty());
+		int32 FromPreLinkCount = 0;
+		int32 ToPreLinkCount = 0;
+		TSharedPtr<FJsonObject> DirectConnectionDecision;
 
 		if (StageBOperation == EStageBOperation::AddNode)
 		{
@@ -2445,6 +2610,8 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			ToNode = Graph ? ResolveNode(Graph, ToNodeGuid) : nullptr;
 			FromPin = FromNode ? ResolvePin(FromNode, FromPinId, FromPinName, EGPD_Output) : nullptr;
 			ToPin = ToNode ? ResolvePin(ToNode, ToPinId, ToPinName, EGPD_Input) : nullptr;
+			FromPreLinkCount = FromPin ? FromPin->LinkedTo.Num() : 0;
+			ToPreLinkCount = ToPin ? ToPin->LinkedTo.Num() : 0;
 			const bool bExactExecutionPins = FromPin && ToPin && FromNode != ToNode
 				&& FromPin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec
 				&& ToPin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec
@@ -2454,12 +2621,12 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			const bool bLinked = bExactExecutionPins && FromPin->LinkedTo.Contains(ToPin) && ToPin->LinkedTo.Contains(FromPin);
 			if (StageBOperation == EStageBOperation::ConnectPins)
 			{
-				const FPinConnectionResponse Response = bExactExecutionPins
+				DirectConnectionResponse = bExactExecutionPins
 					? Schema->CanCreateConnection(FromPin, ToPin)
 					: FPinConnectionResponse(CONNECT_RESPONSE_DISALLOW, FText::GetEmpty());
 				bOperationPreflight = bPayloadValid && bExactExecutionPins && !bLinked
 					&& FromPin->LinkedTo.IsEmpty() && ToPin->LinkedTo.IsEmpty()
-					&& Response.Response == CONNECT_RESPONSE_MAKE;
+					&& DirectConnectionResponse.Response == CONNECT_RESPONSE_MAKE;
 			}
 			else
 			{
@@ -2490,6 +2657,13 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 				return SemanticConnectionKey(A->AsObject()) < SemanticConnectionKey(B->AsObject());
 			});
 			ExpectedPost->SetArrayField(TEXT("connections"), UpdatedConnections);
+		}
+		if (StageBOperation == EStageBOperation::ConnectPins)
+		{
+			DirectConnectionDecision = ConnectionDecisionEvidence(OperationId, Schema, DirectConnectionResponse,
+				FromPin, ToPin, FromPreLinkCount, ToPreLinkCount, false, false, false);
+			Evidence->SetArrayField(TEXT("connection_decisions"), {
+				MakeShared<FJsonValueObject>(DirectConnectionDecision) });
 		}
 
 		const bool bPreflightSucceeded = Blueprint && Graph && Package && Schema && bPreComplete && bPreV2Complete
@@ -2677,8 +2851,14 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		}
 		else if (StageBOperation == EStageBOperation::ConnectPins)
 		{
-			bMutated = Schema->TryCreateConnection(FromPin, ToPin)
+			const bool bTrySucceeded = Schema->TryCreateConnection(FromPin, ToPin);
+			const bool bReciprocalVerified = bTrySucceeded
 				&& FromPin->LinkedTo.Contains(ToPin) && ToPin->LinkedTo.Contains(FromPin);
+			bMutated = bTrySucceeded && bReciprocalVerified;
+			DirectConnectionDecision = ConnectionDecisionEvidence(OperationId, Schema, DirectConnectionResponse,
+				FromPin, ToPin, FromPreLinkCount, ToPreLinkCount, true, bTrySucceeded, bReciprocalVerified);
+			Evidence->SetArrayField(TEXT("connection_decisions"), {
+				MakeShared<FJsonValueObject>(DirectConnectionDecision) });
 			MutationEvidence->SetNumberField(TEXT("changed_connections"), bMutated ? 1 : 0);
 		}
 		else
