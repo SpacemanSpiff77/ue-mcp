@@ -22,6 +22,9 @@
 #include "K2Node_Variable.h"
 #include "K2Node_VariableGet.h"
 #include "K2Node_VariableSet.h"
+#include "K2Node_MakeStruct.h"
+#include "K2Node_BreakStruct.h"
+#include "K2Node_StructOperation.h"
 #include "Misc/EngineVersion.h"
 #include "Misc/App.h"
 #include "Misc/FileHelper.h"
@@ -45,6 +48,8 @@ namespace
 	const TCHAR* CallFunctionCapability = TEXT("graph.add-call-function-standard");
 	const TCHAR* VariableGetCapability = TEXT("graph.add-variable-get");
 	const TCHAR* VariableSetCapability = TEXT("graph.add-variable-set");
+	const TCHAR* MakeStructCapability = TEXT("graph.add-make-struct");
+	const TCHAR* BreakStructCapability = TEXT("graph.add-break-struct");
 	const TCHAR* CapabilityVersion = TEXT("1.0");
 	const TCHAR* OperationVersion = TEXT("graph.set-pin-default@1.0");
 	const TCHAR* HandlerVersion = TEXT("spacehead.graph.set-pin-default-handler@1.0");
@@ -449,7 +454,14 @@ namespace
 			Node->SetStringField(TEXT("existing_node_guid"), Source->GetStringField(TEXT("nodeGuid")));
 			Node->SetStringField(TEXT("node_class"), Source->GetStringField(TEXT("nodeClass")));
 			Node->SetStringField(TEXT("semantic_type"), Source->GetStringField(TEXT("kind")));
-			Node->SetObjectField(TEXT("semantic_properties"), MakeShared<FJsonObject>());
+			TSharedPtr<FJsonObject> SemanticProperties = MakeShared<FJsonObject>();
+			if (const TSharedPtr<FJsonObject> Struct = ObjectField(Source, TEXT("structOperation")))
+			{
+				SemanticProperties->SetStringField(TEXT("struct_operation"), Struct->GetStringField(TEXT("operation")));
+				SemanticProperties->SetStringField(TEXT("struct_type_path"), Struct->GetStringField(TEXT("typePath")));
+				SemanticProperties->SetStringField(TEXT("struct_type_name"), Struct->GetStringField(TEXT("typeName")));
+			}
+			Node->SetObjectField(TEXT("semantic_properties"), SemanticProperties);
 			if (const TSharedPtr<FJsonObject> Variable = ObjectField(Source, TEXT("variable")))
 			{
 				TSharedPtr<FJsonObject> Reference = MakeShared<FJsonObject>();
@@ -594,7 +606,14 @@ namespace
 			Node->SetStringField(TEXT("existing_node_guid"), Source->GetStringField(TEXT("nodeGuid")));
 			Node->SetStringField(TEXT("node_class"), Source->GetStringField(TEXT("nodeClass")));
 			Node->SetStringField(TEXT("semantic_type"), Source->GetStringField(TEXT("kind")));
-			Node->SetObjectField(TEXT("semantic_properties"), MakeShared<FJsonObject>());
+			TSharedPtr<FJsonObject> SemanticProperties = MakeShared<FJsonObject>();
+			if (const TSharedPtr<FJsonObject> Struct = ObjectField(Source, TEXT("structOperation")))
+			{
+				SemanticProperties->SetStringField(TEXT("struct_operation"), Struct->GetStringField(TEXT("operation")));
+				SemanticProperties->SetStringField(TEXT("struct_type_path"), Struct->GetStringField(TEXT("typePath")));
+				SemanticProperties->SetStringField(TEXT("struct_type_name"), Struct->GetStringField(TEXT("typeName")));
+			}
+			Node->SetObjectField(TEXT("semantic_properties"), SemanticProperties);
 			if (const TSharedPtr<FJsonObject> Variable = ObjectField(Source, TEXT("variable")))
 			{
 				TSharedPtr<FJsonObject> Reference = MakeShared<FJsonObject>();
@@ -1192,6 +1211,64 @@ namespace
 		return Property;
 	}
 
+	UScriptStruct* ResolveExactStructOperation(const TSharedPtr<FJsonObject>& Payload, FString& FailureCode)
+	{
+		FailureCode = TEXT("STRUCT_RESOLUTION_MISMATCH");
+		FString CandidateId, SemanticMemberId, Operation, StructPath, StructName, Spawner, NodeClass;
+		FString SignatureDigest, MetadataDigest, TypeIdentity, FixedPinDigest, AdmissionState;
+		const TSharedPtr<FJsonObject> Aggregate = ObjectField(Payload, TEXT("aggregate_pin"));
+		const TArray<TSharedPtr<FJsonValue>>* Members = ArrayField(Payload, TEXT("member_pins"));
+		if (!Payload.IsValid()
+			|| !Payload->TryGetStringField(TEXT("candidate_id"), CandidateId) || !ValidHash(CandidateId)
+			|| !Payload->TryGetStringField(TEXT("semantic_member_id"), SemanticMemberId) || !ValidHash(SemanticMemberId)
+			|| !Payload->TryGetStringField(TEXT("struct_operation"), Operation)
+			|| (Operation != TEXT("MAKE") && Operation != TEXT("BREAK"))
+			|| !Payload->TryGetStringField(TEXT("struct_type_path"), StructPath) || StructPath.IsEmpty()
+			|| !Payload->TryGetStringField(TEXT("struct_type_name"), StructName) || StructName.IsEmpty()
+			|| !Payload->TryGetStringField(TEXT("selected_spawner"), Spawner)
+			|| Spawner != TEXT("/Script/BlueprintGraph.BlueprintNodeSpawner")
+			|| !Payload->TryGetStringField(TEXT("selected_k2_node_class"), NodeClass)
+			|| NodeClass != (Operation == TEXT("MAKE") ? TEXT("/Script/BlueprintGraph.K2Node_MakeStruct")
+				: TEXT("/Script/BlueprintGraph.K2Node_BreakStruct"))
+			|| !Payload->TryGetStringField(TEXT("signature_digest"), SignatureDigest) || !ValidHash(SignatureDigest)
+			|| !Payload->TryGetStringField(TEXT("metadata_digest"), MetadataDigest) || !ValidHash(MetadataDigest)
+			|| !Payload->TryGetStringField(TEXT("struct_type_identity"), TypeIdentity) || !ValidHash(TypeIdentity)
+			|| !Payload->TryGetStringField(TEXT("fixed_pin_digest"), FixedPinDigest) || !ValidHash(FixedPinDigest)
+			|| !Payload->TryGetStringField(TEXT("admission_state"), AdmissionState)
+			|| AdmissionState != TEXT("ADMITTED_FOR_FIXED_STRUCT_V1") || !Aggregate.IsValid() || !Members || Members->Num() < 1)
+			return nullptr;
+		UScriptStruct* Struct = FindObject<UScriptStruct>(nullptr, *StructPath);
+		if (!Struct) Struct = LoadObject<UScriptStruct>(nullptr, *StructPath);
+		if (!Struct || Struct->GetPathName() != StructPath || Struct->GetName() != StructName) return nullptr;
+		FString AggregateDirection;
+		const TSharedPtr<FJsonObject> AggregateType = ObjectField(Aggregate, TEXT("pin_type"));
+		FEdGraphPinType ExpectedAggregate;
+		ExpectedAggregate.PinCategory = UEdGraphSchema_K2::PC_Struct;
+		ExpectedAggregate.PinSubCategoryObject = Struct;
+		if (!Aggregate->TryGetStringField(TEXT("direction"), AggregateDirection)
+			|| AggregateDirection != (Operation == TEXT("MAKE") ? TEXT("output") : TEXT("input"))
+			|| !ExactExpectedPinType(AggregateType, ExpectedAggregate)) return nullptr;
+		TSet<FString> Names;
+		for (const TSharedPtr<FJsonValue>& Value : *Members)
+		{
+			const TSharedPtr<FJsonObject> Member = Value->AsObject();
+			const TSharedPtr<FJsonObject> ExpectedType = ObjectField(Member, TEXT("pin_type"));
+			FString Name, Direction;
+			if (!Member.IsValid() || !Member->TryGetStringField(TEXT("name"), Name) || Name.IsEmpty()
+				|| Names.Contains(Name) || !Member->TryGetStringField(TEXT("direction"), Direction)
+				|| Direction != (Operation == TEXT("MAKE") ? TEXT("input") : TEXT("output"))) return nullptr;
+			FProperty* Property = FindFProperty<FProperty>(Struct, *Name);
+			FEdGraphPinType LiveType;
+			if (!Property || !Property->HasAnyPropertyFlags(CPF_BlueprintVisible)
+				|| !GetDefault<UEdGraphSchema_K2>()->ConvertPropertyToPinType(Property, LiveType)
+				|| !ExactExpectedPinType(ExpectedType, LiveType) || LiveType.ContainerType != EPinContainerType::None
+				|| LiveType.bIsReference || LiveType.bIsWeakPointer || LiveType.bIsUObjectWrapper
+				|| LiveType.PinCategory == UEdGraphSchema_K2::PC_Wildcard) return nullptr;
+			Names.Add(Name);
+		}
+		return Struct;
+	}
+
 	TSharedPtr<FJsonObject> FindSemanticPin(
 		const TSharedPtr<FJsonObject>& Topology,
 		const FString& NodeGuid,
@@ -1620,7 +1697,9 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 	if (Operations && (Operations->Num() > 1
 		|| FirstOperationVersion == TEXT("graph.add-call-function-standard@1.0")
 		|| FirstOperationVersion == TEXT("graph.add-variable-get@1.0")
-		|| FirstOperationVersion == TEXT("graph.add-variable-set@1.0")))
+		|| FirstOperationVersion == TEXT("graph.add-variable-set@1.0")
+		|| FirstOperationVersion == TEXT("graph.add-make-struct@1.0")
+		|| FirstOperationVersion == TEXT("graph.add-break-struct@1.0")))
 	{
 		const TSharedPtr<FJsonObject> SpecTarget = ObjectField(BuildSpec, TEXT("target"));
 		const TArray<TSharedPtr<FJsonValue>>* SpecOperations = ArrayField(BuildSpec, TEXT("operations"));
@@ -1778,6 +1857,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		TMap<FString, UFunction*> PlannedLogicalCallFunctions;
 		TArray<FString> PlannedCallFunctionGuids;
 		TArray<FString> PlannedVariableGuids;
+		TArray<FString> PlannedStructGuids;
 		for (const TSharedPtr<FJsonValue>& Value : *Operations)
 		{
 			const TSharedPtr<FJsonObject> PlannedOperation = Value->AsObject();
@@ -1899,6 +1979,54 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			PlannedLogicalVariableMemberGuids.Add(LogicalId, MemberGuid);
 		}
 
+		TMap<FString, UScriptStruct*> PlannedStructTypes;
+		TMap<FString, UScriptStruct*> PlannedLogicalStructTypes;
+		TMap<FString, bool> PlannedLogicalStructMakes;
+		for (const TSharedPtr<FJsonValue>& Value : *Operations)
+		{
+			const TSharedPtr<FJsonObject> PlannedOperation = Value->AsObject();
+			FString OperationId, Version, Capability;
+			if (!PlannedOperation.IsValid()
+				|| !PlannedOperation->TryGetStringField(TEXT("operation_id"), OperationId)
+				|| !PlannedOperation->TryGetStringField(TEXT("operation_version"), Version)
+				|| (Version != TEXT("graph.add-make-struct@1.0")
+					&& Version != TEXT("graph.add-break-struct@1.0"))) continue;
+			const bool bMake = Version == TEXT("graph.add-make-struct@1.0");
+			const TSharedPtr<FJsonObject> Payload = ObjectField(PlannedOperation, TEXT("semantic_payload"));
+			const TSharedPtr<FJsonObject> SpecOperation = SpecById.FindRef(OperationId);
+			const TSharedPtr<FJsonObject> SpecPayload = ObjectField(SpecOperation, TEXT("payload"));
+			const TSharedPtr<FJsonObject> RequestedStruct = ObjectField(SpecPayload, TEXT("struct"));
+			FString SpecKind, SpecVersionValue, RequestedPath, StructPath, StructOperation, LogicalId;
+			if (RequestedStruct.IsValid()) RequestedStruct->TryGetStringField(TEXT("type_path"), RequestedPath);
+			if (!PlannedOperation->TryGetStringField(TEXT("semantic_capability_id"), Capability)
+				|| Capability != (bMake ? MakeStructCapability : BreakStructCapability)
+				|| !SpecOperation.IsValid() || !SpecPayload.IsValid() || !RequestedStruct.IsValid()
+				|| !SpecOperation->TryGetStringField(TEXT("kind"), SpecKind)
+				|| SpecKind != (bMake ? TEXT("add_make_struct") : TEXT("add_break_struct"))
+				|| !SpecOperation->TryGetStringField(TEXT("operation_version"), SpecVersionValue) || SpecVersionValue != Version
+				|| !Payload.IsValid() || !Payload->TryGetStringField(TEXT("struct_operation"), StructOperation)
+				|| StructOperation != (bMake ? TEXT("MAKE") : TEXT("BREAK"))
+				|| !Payload->TryGetStringField(TEXT("struct_type_path"), StructPath) || StructPath != RequestedPath
+				|| !Payload->TryGetStringField(TEXT("logical_id"), LogicalId) || LogicalId.IsEmpty()
+				|| PlannedLogicalStructTypes.Contains(LogicalId))
+			{
+				SetFailure(Receipt, TEXT("LIVE_PREFLIGHT"), TEXT("STRUCT_RESOLUTION_MISMATCH"), TEXT("FAILED_PRE_MUTATION"),
+					TEXT("Struct BuildSpec, BuildPlan, and admission identities do not match"));
+				return Complete(Receipt);
+			}
+			FString StructFailure;
+			UScriptStruct* Struct = ResolveExactStructOperation(Payload, StructFailure);
+			if (!Struct)
+			{
+				SetFailure(Receipt, TEXT("LIVE_PREFLIGHT"), StructFailure, TEXT("FAILED_PRE_MUTATION"),
+					TEXT("The exact live UScriptStruct no longer matches the accepted candidate"));
+				return Complete(Receipt);
+			}
+			PlannedStructTypes.Add(OperationId, Struct);
+			PlannedLogicalStructTypes.Add(LogicalId, Struct);
+			PlannedLogicalStructMakes.Add(LogicalId, bMake);
+		}
+
 		for (const TSharedPtr<FJsonValue>& Value : *Operations)
 		{
 			const TSharedPtr<FJsonObject> PlannedOperation = Value->AsObject();
@@ -1916,9 +2044,13 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 				? PlannedLogicalCallFunctions.FindRef(LogicalId) : nullptr;
 			FProperty* Property = Reference.IsValid() && Kind == TEXT("logical") && !LogicalId.IsEmpty()
 				? PlannedLogicalVariableProperties.FindRef(LogicalId) : nullptr;
-			if (Function && Payload->TryGetStringField(TEXT("pin_name"), PinName))
+			Payload->TryGetStringField(TEXT("pin_name"), PinName);
+			if (Function && !PinName.IsEmpty())
 				for (TFieldIterator<FProperty> It(Function); It && It->HasAnyPropertyFlags(CPF_Parm); ++It)
 					if (It->GetName() == PinName) { Property = *It; break; }
+			if (!Property)
+				if (UScriptStruct* Struct = PlannedLogicalStructTypes.FindRef(LogicalId))
+					Property = FindFProperty<FProperty>(Struct, *PinName);
 			FEdGraphPinType PinType;
 			const bool bQualified = Property && Payload->TryGetStringField(TEXT("desired_unreal_value"), DesiredValue)
 				&& GetDefault<UEdGraphSchema_K2>()->ConvertPropertyToPinType(Property, PinType)
@@ -2361,6 +2493,78 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 				}
 				if (!bSucceeded) FailureCode = TEXT("VARIABLE_CONSTRUCTION_FAILED");
 			}
+			else if ((Version == TEXT("graph.add-make-struct@1.0") && Capability == MakeStructCapability
+					&& SpecKind == TEXT("add_make_struct"))
+				|| (Version == TEXT("graph.add-break-struct@1.0") && Capability == BreakStructCapability
+					&& SpecKind == TEXT("add_break_struct")))
+			{
+				const bool bMake = Version == TEXT("graph.add-make-struct@1.0");
+				FString LogicalId, CreatedGuid, StructPath, SemanticType;
+				double X = 0, Y = 0;
+				const TSharedPtr<FJsonObject> Position = ObjectField(Payload, TEXT("position"));
+				const TSharedPtr<FJsonObject> Aggregate = ObjectField(Payload, TEXT("aggregate_pin"));
+				const TArray<TSharedPtr<FJsonValue>>* Members = ArrayField(Payload, TEXT("member_pins"));
+				FGuid ParsedGuid;
+				UScriptStruct* Struct = PlannedStructTypes.FindRef(OperationId);
+				if (Position.IsValid() && Aggregate.IsValid() && Members && Struct
+					&& Payload->TryGetStringField(TEXT("logical_id"), LogicalId)
+					&& Payload->TryGetStringField(TEXT("created_node_guid"), CreatedGuid) && FGuid::Parse(CreatedGuid, ParsedGuid)
+					&& Payload->TryGetStringField(TEXT("struct_type_path"), StructPath) && StructPath == Struct->GetPathName()
+					&& Payload->TryGetStringField(TEXT("semantic_type"), SemanticType)
+					&& SemanticType == (bMake ? TEXT("make-struct") : TEXT("break-struct"))
+					&& Position->TryGetNumberField(TEXT("x"), X) && Position->TryGetNumberField(TEXT("y"), Y)
+					&& !LogicalNodes.Contains(LogicalId) && !ResolveNode(Graph, CreatedGuid))
+				{
+					Graph->Modify(); Blueprint->Modify();
+					UK2Node_StructOperation* StructNode = bMake
+						? static_cast<UK2Node_StructOperation*>(NewObject<UK2Node_MakeStruct>(Graph))
+						: static_cast<UK2Node_StructOperation*>(NewObject<UK2Node_BreakStruct>(Graph));
+					StructNode->StructType = Struct;
+					StructNode->NodeGuid = ParsedGuid;
+					StructNode->NodePosX = static_cast<int32>(X); StructNode->NodePosY = static_cast<int32>(Y);
+					Graph->AddNode(StructNode, false, false); StructNode->AllocateDefaultPins(); StructNode->PostPlacedNewNode();
+					LogicalNodes.Add(LogicalId, StructNode);
+					Applied.Add({ EAppliedKind::AddedNode, OperationId, StructNode });
+					bMutationOccurred = true;
+					bSucceeded = StructNode->NodeGuid == ParsedGuid && StructNode->StructType == Struct
+						&& StructNode->Pins.Num() == Members->Num() + 1;
+					auto ExactPayloadPin = [&](const TSharedPtr<FJsonObject>& Expected) -> bool
+					{
+						FString Name, Direction;
+						const TSharedPtr<FJsonObject> ExpectedType = ObjectField(Expected, TEXT("pin_type"));
+						if (!Expected.IsValid() || !Expected->TryGetStringField(TEXT("name"), Name)
+							|| !Expected->TryGetStringField(TEXT("direction"), Direction)) return false;
+						const EEdGraphPinDirection PinDirection = Direction == TEXT("input") ? EGPD_Input : EGPD_Output;
+						TArray<UEdGraphPin*> Matches = StructNode->Pins.FilterByPredicate([&](UEdGraphPin* Pin)
+							{ return Pin && Pin->PinName.ToString() == Name && Pin->Direction == PinDirection; });
+						return Matches.Num() == 1 && ExactExpectedPinType(ExpectedType, Matches[0]->PinType);
+					};
+					bSucceeded = bSucceeded && ExactPayloadPin(Aggregate);
+					for (const TSharedPtr<FJsonValue>& Member : *Members)
+						bSucceeded = bSucceeded && ExactPayloadPin(Member->AsObject());
+					if (bSucceeded)
+					{
+						bool bCurrentComplete = false, bCurrentV2Complete = false;
+						const TSharedPtr<FJsonObject> Current = SemanticTopology(Graph, GraphType, bCurrentComplete);
+						const TSharedPtr<FJsonObject> CurrentV2 = SemanticTopologyV2(Graph, GraphType, bCurrentV2Complete);
+						const FString NodeId = SemanticNodeId(CurrentV2, StructNode);
+						const TArray<TSharedPtr<FJsonValue>>* NodesV2 = ArrayField(CurrentV2, TEXT("nodes"));
+						TSharedPtr<FJsonObject> NodeV2;
+						if (NodesV2) for (const TSharedPtr<FJsonValue>& NodeValue : *NodesV2)
+							if (NodeValue->AsObject()->GetStringField(TEXT("node_id")) == NodeId) NodeV2 = NodeValue->AsObject();
+						const TSharedPtr<FJsonObject> Properties = ObjectField(NodeV2, TEXT("semantic_properties"));
+						bSucceeded = bCurrentComplete && bCurrentV2Complete && NodeV2.IsValid() && Properties.IsValid()
+							&& NodeV2->GetStringField(TEXT("node_class")) == (bMake ? TEXT("K2Node_MakeStruct") : TEXT("K2Node_BreakStruct"))
+							&& NodeV2->GetStringField(TEXT("semantic_type")) == (bMake ? TEXT("make-struct") : TEXT("break-struct"))
+							&& Properties->GetStringField(TEXT("struct_operation")) == (bMake ? TEXT("make") : TEXT("break"))
+							&& Properties->GetStringField(TEXT("struct_type_path")) == StructPath
+							&& AppendExpectedNode(ExpectedPost, Current, CreatedGuid)
+							&& AppendExpectedNode(ExpectedPostV2, CurrentV2, CreatedGuid);
+						if (bSucceeded) PlannedStructGuids.Add(CreatedGuid);
+					}
+				}
+				if (!bSucceeded) FailureCode = TEXT("STRUCT_CONSTRUCTION_FAILED");
+			}
 			else if (Version == TEXT("graph.set-pin-default@1.0") && Capability == SemanticCapability && SpecKind == TEXT("set_pin_default"))
 			{
 				const TSharedPtr<FJsonObject> Reference = ObjectField(Payload, TEXT("node_reference"));
@@ -2592,6 +2796,11 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			bPostComplete = bPostComplete && AppendExpectedNode(ExpectedPost, PostTopology, CreatedGuid);
 			bPostV2Complete = bPostV2Complete && AppendExpectedNode(ExpectedPostV2, PostTopologyV2, CreatedGuid);
 		}
+		for (const FString& CreatedGuid : PlannedStructGuids)
+		{
+			bPostComplete = bPostComplete && AppendExpectedNode(ExpectedPost, PostTopology, CreatedGuid);
+			bPostV2Complete = bPostV2Complete && AppendExpectedNode(ExpectedPostV2, PostTopologyV2, CreatedGuid);
+		}
 		for (const FAppliedOperation& Action : Applied)
 		{
 			if (Action.Kind != EAppliedKind::Connected && Action.Kind != EAppliedKind::Disconnected) continue;
@@ -2625,6 +2834,15 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			else if (UK2Node_CallFunction* Call = Cast<UK2Node_CallFunction>(Pair.Value))
 			{
 				if (Call->GetClass() != UK2Node_CallFunction::StaticClass() || !Call->GetTargetFunction()) bLogicalNodeIdentityExact = false;
+			}
+			else if (UK2Node_StructOperation* StructNode = Cast<UK2Node_StructOperation>(Pair.Value))
+			{
+				UScriptStruct* const* ExpectedStruct = PlannedLogicalStructTypes.Find(Pair.Key);
+				const bool* bExpectedMake = PlannedLogicalStructMakes.Find(Pair.Key);
+				const UClass* ExpectedClass = bExpectedMake && *bExpectedMake
+					? UK2Node_MakeStruct::StaticClass() : UK2Node_BreakStruct::StaticClass();
+				if (!ExpectedStruct || !bExpectedMake || StructNode->GetClass() != ExpectedClass
+					|| StructNode->StructType != *ExpectedStruct) bLogicalNodeIdentityExact = false;
 			}
 			else if (UK2Node_Variable* Variable = Cast<UK2Node_Variable>(Pair.Value))
 			{

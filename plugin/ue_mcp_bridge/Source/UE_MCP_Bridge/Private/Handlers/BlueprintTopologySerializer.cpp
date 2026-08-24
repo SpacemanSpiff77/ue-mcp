@@ -11,6 +11,9 @@
 #include "K2Node_DynamicCast.h"
 #include "K2Node_FunctionEntry.h"
 #include "K2Node_IfThenElse.h"
+#include "K2Node_MakeStruct.h"
+#include "K2Node_BreakStruct.h"
+#include "K2Node_StructOperation.h"
 #include "K2Node_MacroInstance.h"
 #include "K2Node_VariableGet.h"
 #include "K2Node_VariableSet.h"
@@ -116,6 +119,8 @@ namespace
 		if (Cast<UK2Node_VariableGet>(Node)) return TEXT("variable-get");
 		if (Cast<UK2Node_VariableSet>(Node)) return TEXT("variable-set");
 		if (Cast<UK2Node_CallFunction>(Node)) return TEXT("function-call");
+		if (Cast<UK2Node_MakeStruct>(Node)) return TEXT("make-struct");
+		if (Cast<UK2Node_BreakStruct>(Node)) return TEXT("break-struct");
 		if (Cast<UK2Node_MacroInstance>(Node))
 		{
 			const FString Title = Node->GetNodeTitle(ENodeTitleType::ListView).ToString();
@@ -288,6 +293,15 @@ UE_MCP_BlueprintTopology::FSerializedGraphTopology UE_MCP_BlueprintTopology::Ser
 				Called->SetStringField(TEXT("authoritativeOwner"), Authoritative ? Authoritative->GetPathName() : FString());
 				Called->SetStringField(TEXT("callMode"), Function->HasAnyFunctionFlags(FUNC_Static) ? TEXT("static") : TEXT("instance"));
 			}
+		}
+		else if (UK2Node_StructOperation* StructNode = Cast<UK2Node_StructOperation>(Node))
+		{
+			TSharedPtr<FJsonObject> StructJson = MakeShared<FJsonObject>();
+			StructJson->SetStringField(TEXT("operation"), Cast<UK2Node_MakeStruct>(Node) ? TEXT("make") : TEXT("break"));
+			StructJson->SetStringField(TEXT("typePath"), StructNode->StructType ? StructNode->StructType->GetPathName() : FString());
+			StructJson->SetStringField(TEXT("typeName"), StructNode->StructType ? StructNode->StructType->GetName() : FString());
+			NodeJson->SetObjectField(TEXT("structOperation"), StructJson);
+			if (StructNode->StructType) SemanticIdentity = StructNode->StructType->GetPathName();
 		}
 		else if (UK2Node_MacroInstance* Macro = Cast<UK2Node_MacroInstance>(Node))
 		{

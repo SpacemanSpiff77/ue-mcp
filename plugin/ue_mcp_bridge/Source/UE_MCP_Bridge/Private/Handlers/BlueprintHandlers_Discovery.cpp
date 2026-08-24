@@ -11,6 +11,7 @@
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraphSchema_K2.h"
+#include "EdGraph/EdGraphPin.h"
 #include "Engine/Blueprint.h"
 #include "Engine/Engine.h"
 #include "HandlerUtils.h"
@@ -134,6 +135,23 @@ namespace BlueprintActionDiscovery
 		Result->SetBoolField(TEXT("has_default"), bHasDefault);
 		Result->SetStringField(TEXT("default_value"), bHasDefault ? Function->GetMetaData(*DefaultKey) : FString());
 		Result->SetBoolField(TEXT("required"), Direction(Property) == TEXT("input") && !bHasDefault);
+		return Result;
+	}
+
+	static TSharedPtr<FJsonObject> SerializeTemplatePin(const UEdGraphPin* Pin, int32 Index)
+	{
+		TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+		Result->SetNumberField(TEXT("index"), Index);
+		Result->SetStringField(TEXT("name"), Pin ? Pin->PinName.ToString() : FString());
+		Result->SetStringField(TEXT("direction"), Pin && Pin->Direction == EGPD_Output ? TEXT("output") : TEXT("input"));
+		Result->SetStringField(TEXT("property_class"), FString());
+		Result->SetBoolField(TEXT("const"), Pin && Pin->PinType.bIsConst);
+		Result->SetBoolField(TEXT("reference"), Pin && Pin->PinType.bIsReference);
+		Result->SetBoolField(TEXT("out"), Pin && Pin->Direction == EGPD_Output);
+		Result->SetBoolField(TEXT("return"), false);
+		Result->SetBoolField(TEXT("has_default"), Pin && !Pin->DefaultValue.IsEmpty());
+		Result->SetBoolField(TEXT("required"), false);
+		Result->SetObjectField(TEXT("pin_type"), SerializePinType(Pin ? Pin->PinType : FEdGraphPinType()));
 		return Result;
 	}
 
@@ -273,6 +291,10 @@ namespace BlueprintActionDiscovery
 		const FFieldVariant AssociatedField = Info.GetAssociatedMemberField();
 		const UFunction* Function = Info.GetAssociatedFunction();
 		const FProperty* Property = Info.GetAssociatedProperty();
+		UScriptStruct* Struct = Cast<UScriptStruct>(AssociatedField.ToUObject());
+		if (!Struct) Struct = Cast<UScriptStruct>(const_cast<UObject*>(ActionOwner));
+		const bool bStructOperation = Struct && (Spawner->NodeClass->GetName() == TEXT("K2Node_MakeStruct")
+			|| Spawner->NodeClass->GetName() == TEXT("K2Node_BreakStruct"));
 		const FString ActionOwnerPath = ActionOwner->GetPathName();
 		const FBlueprintNodeSignature Signature = Spawner->GetSpawnerSignature();
 		TSharedPtr<FJsonObject> Action = MakeShared<FJsonObject>();
@@ -281,8 +303,9 @@ namespace BlueprintActionDiscovery
 		Action->SetStringField(TEXT("spawner_class"), Spawner->GetClass()->GetPathName());
 		Action->SetStringField(TEXT("k2_node_class"), Spawner->NodeClass->GetPathName());
 		Action->SetStringField(TEXT("associated_field_kind"), Function ? TEXT("function") : Property ? TEXT("property")
+			: bStructOperation ? TEXT("struct")
 			: AssociatedField.IsValid() ? TEXT("field") : TEXT("none"));
-		Action->SetStringField(TEXT("associated_field_path"), FieldPath(AssociatedField));
+		Action->SetStringField(TEXT("associated_field_path"), bStructOperation ? Struct->GetPathName() : FieldPath(AssociatedField));
 		Action->SetStringField(TEXT("spawner_signature"), Signature.ToString());
 		Action->SetStringField(TEXT("spawner_signature_guid"), Signature.AsGuid().ToString(EGuidFormats::Digits));
 		FBlueprintActionContext UiContext;
@@ -308,11 +331,28 @@ namespace BlueprintActionDiscovery
 			PropertyJson->SetStringField(TEXT("module_or_plugin"), ModuleProvenance(DeclaringStruct));
 			Action->SetObjectField(TEXT("property"), PropertyJson);
 		}
+		UEdGraph* TargetGraph = Contexts.Num() > 0 ? Contexts[0].Graph : nullptr;
+		UEdGraphNode* Template = bStructOperation || bIncludeTemplateEvidence ? Spawner->GetTemplateNode(TargetGraph) : nullptr;
+		if (bStructOperation)
+		{
+			TSharedPtr<FJsonObject> StructJson = MakeShared<FJsonObject>();
+			StructJson->SetStringField(TEXT("type_path"), Struct->GetPathName());
+			StructJson->SetStringField(TEXT("type_name"), Struct->GetName());
+			StructJson->SetStringField(TEXT("module_or_plugin"), ModuleProvenance(Struct));
+			TArray<TSharedPtr<FJsonValue>> Members;
+			int32 MemberIndex = 0;
+			for (TFieldIterator<FProperty> It(Struct); It; ++It)
+				Members.Add(MakeShared<FJsonValueObject>(SerializeProperty(*It, nullptr, MemberIndex++)));
+			StructJson->SetArrayField(TEXT("members"), Members);
+			TArray<TSharedPtr<FJsonValue>> Pins;
+			if (Template) for (int32 PinIndex = 0; PinIndex < Template->Pins.Num(); ++PinIndex)
+				if (Template->Pins[PinIndex]) Pins.Add(MakeShared<FJsonValueObject>(SerializeTemplatePin(Template->Pins[PinIndex], PinIndex)));
+			StructJson->SetArrayField(TEXT("pins"), Pins);
+			Action->SetObjectField(TEXT("struct_operation"), StructJson);
+		}
 		AddContextAvailability(Action, ActionOwner, Spawner, Contexts);
 		if (bIncludeTemplateEvidence)
 		{
-			UEdGraph* TargetGraph = Contexts.Num() > 0 ? Contexts[0].Graph : nullptr;
-			UEdGraphNode* Template = Spawner->GetTemplateNode(TargetGraph);
 			TSharedPtr<FJsonObject> TemplateEvidence = MakeShared<FJsonObject>();
 			TemplateEvidence->SetBoolField(TEXT("available"), Template != nullptr);
 			TemplateEvidence->SetStringField(TEXT("node_class"), Template ? Template->GetClass()->GetPathName() : FString());

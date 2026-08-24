@@ -54,7 +54,7 @@
         "operation_id": { "$ref": "#/$defs/nonEmpty" },
         "family": { "const": "graph" },
         "kind": { "enum": ["add_node", "add_variable_get", "add_variable_set", "set_pin_default", "connect_pins", "disconnect_pins"] },
-        "operation_version": { "enum": ["graph.add-node@1.0", "graph.add-call-function-standard@1.0", "graph.add-variable-get@1.0", "graph.add-variable-set@1.0", "graph.set-pin-default@1.0", "graph.connect-pins@1.0", "graph.disconnect-pins@1.0"] },
+        "operation_version": { "enum": ["graph.add-node@1.0", "graph.add-call-function-standard@1.0", "graph.add-variable-get@1.0", "graph.add-variable-set@1.0", "graph.add-make-struct@1.0", "graph.add-break-struct@1.0", "graph.set-pin-default@1.0", "graph.connect-pins@1.0", "graph.disconnect-pins@1.0"] },
         "depends_on": { "type": "array", "maxItems": 7, "uniqueItems": true, "items": { "$ref": "#/$defs/nonEmpty" } },
         "payload": { "type": "object" }
       }
@@ -75,9 +75,9 @@
       "required": ["operation_id", "semantic_capability_id", "capability_version", "operation_version", "depends_on", "existing_node_identities", "future_node_identities", "pin_expectations", "semantic_payload"],
       "properties": {
         "operation_id": { "$ref": "#/$defs/nonEmpty" },
-        "semantic_capability_id": { "enum": ["graph.add-node", "graph.add-call-function-standard", "graph.add-variable-get", "graph.add-variable-set", "graph.set-pin-default", "graph.connect-pins", "graph.disconnect-pins"] },
+        "semantic_capability_id": { "enum": ["graph.add-node", "graph.add-call-function-standard", "graph.add-variable-get", "graph.add-variable-set", "graph.add-make-struct", "graph.add-break-struct", "graph.set-pin-default", "graph.connect-pins", "graph.disconnect-pins"] },
         "capability_version": { "const": "1.0" },
-        "operation_version": { "enum": ["graph.add-node@1.0", "graph.add-call-function-standard@1.0", "graph.add-variable-get@1.0", "graph.add-variable-set@1.0", "graph.set-pin-default@1.0", "graph.connect-pins@1.0", "graph.disconnect-pins@1.0"] },
+        "operation_version": { "enum": ["graph.add-node@1.0", "graph.add-call-function-standard@1.0", "graph.add-variable-get@1.0", "graph.add-variable-set@1.0", "graph.add-make-struct@1.0", "graph.add-break-struct@1.0", "graph.set-pin-default@1.0", "graph.connect-pins@1.0", "graph.disconnect-pins@1.0"] },
         "depends_on": { "type": "array", "maxItems": 7, "uniqueItems": true, "items": { "$ref": "#/$defs/nonEmpty" } },
         "target_graph_identity": { "type": "object" },
         "existing_node_identities": { "type": "array", "maxItems": 2 },
