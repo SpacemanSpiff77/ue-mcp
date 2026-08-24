@@ -17,6 +17,8 @@ describe("atomic bridge fixed-struct Pass 1 contract", () => {
     expect(wire).toContain("graph.add-make-struct@1.0");
     expect(wire).toContain("graph.add-break-struct@1.0");
     expect(wire).not.toContain("set-members-in-struct");
+    expect(handler).toContain("CapabilityJson(MakeStructCapability)");
+    expect(handler).toContain("CapabilityJson(BreakStructCapability)");
   });
 
   it("discovers exact reflected struct identity and template pin evidence", () => {

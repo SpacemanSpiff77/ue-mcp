@@ -1530,6 +1530,8 @@ namespace
 			CapabilityJson(CallFunctionCapability),
 			CapabilityJson(VariableGetCapability),
 			CapabilityJson(VariableSetCapability),
+			CapabilityJson(MakeStructCapability),
+			CapabilityJson(BreakStructCapability),
 		});
 		return Result;
 	}
