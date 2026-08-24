@@ -54,6 +54,9 @@ describe("atomic bridge exact build and schema identity", () => {
     expect(script).toContain("git rev-parse HEAD");
     expect(script).toContain("SPACEHEAD_BRIDGE_GIT_COMMIT");
     expect(script).toContain("generateAtomicBridgeBuildIdentity");
+    expect(script).toContain("path.basename(projectFile, path.extname(projectFile))");
+    expect(script).toContain("editorTarget");
+    expect(script).not.toContain("'ue_mcpEditor'");
     expect(script).toContain("-NoUBTMakefiles");
     expect(handler).toContain("AtomicBridgeBuildIdentity.generated.h");
     expect(handler).not.toContain("spacehead-pass2-atomic-build@1");

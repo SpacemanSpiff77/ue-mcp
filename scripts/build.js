@@ -137,8 +137,9 @@ async function main() {
   log('');
 
   // Build command arguments
+  const editorTarget = `${path.basename(projectFile, path.extname(projectFile))}Editor`;
   const buildArgs = [
-    'ue_mcpEditor',
+    editorTarget,
     'Win64',
     'Development',
     `-Project="${projectFile}"`,
