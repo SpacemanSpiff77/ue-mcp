@@ -42,6 +42,8 @@ describe("atomic Builder Variable/Property Pass 1", () => {
     expect(handler).toContain("PlannedVariableGuids");
     expect(handler).toContain("PlannedLogicalVariableGets");
     expect(handler).toContain("UK2Node_Variable* Variable = Cast<UK2Node_Variable>(Pair.Value)");
+    expect(handler).toContain('SetBoolField(TEXT("logical_node_identity_exact")');
+    expect(handler).toContain('SetBoolField(TEXT("applied_state_exact")');
     expect(topology).toContain("ExactVariableOwner");
     expect(topology).toContain('SetStringField(TEXT("memberGuid")');
     expect(topology).toContain('SetBoolField(TEXT("selfContext")');

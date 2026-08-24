@@ -2602,22 +2602,27 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			bPostV2Complete ? Sha256(CanonicalJsonObject(PostTopologyV2)) : FString());
 		const TSharedPtr<FJsonObject> CanonicalExpectedPost = CanonicalizeFixtureTopology(ExpectedPost);
 		const TSharedPtr<FJsonObject> CanonicalExpectedPostV2 = CanonicalizeFixtureTopology(ExpectedPostV2);
-		bool bVerified = bPostComplete && bPostV2Complete && CanonicalExpectedPost.IsValid() && CanonicalExpectedPostV2.IsValid()
-			&& CanonicalJsonObject(PostTopology) == CanonicalJsonObject(CanonicalExpectedPost)
-			&& CanonicalJsonObject(PostTopologyV2) == CanonicalJsonObject(CanonicalExpectedPostV2)
-			&& FaultCheckpoint != TEXT("VERIFICATION_FAILURE");
+		const bool bTopologyExact = bPostComplete && CanonicalExpectedPost.IsValid()
+			&& CanonicalJsonObject(PostTopology) == CanonicalJsonObject(CanonicalExpectedPost);
+		const bool bTopologyV2Exact = bPostV2Complete && CanonicalExpectedPostV2.IsValid()
+			&& CanonicalJsonObject(PostTopologyV2) == CanonicalJsonObject(CanonicalExpectedPostV2);
+		bool bLogicalNodeIdentityExact = true;
+		bool bAppliedStateExact = true;
+		bool bVerified = bTopologyExact && bTopologyV2Exact && FaultCheckpoint != TEXT("VERIFICATION_FAILURE");
 		const TArray<TSharedPtr<FJsonValue>>* BaselineNodes = ArrayField(BaselineTopology, TEXT("nodes"));
 		const TArray<TSharedPtr<FJsonValue>>* PostNodes = ArrayField(PostTopology, TEXT("nodes"));
-		if (!BaselineNodes || !PostNodes || PostNodes->Num() != BaselineNodes->Num() + LogicalNodes.Num()) bVerified = false;
+		const bool bNodeCountExact = BaselineNodes && PostNodes
+			&& PostNodes->Num() == BaselineNodes->Num() + LogicalNodes.Num();
+		if (!bNodeCountExact) bVerified = false;
 		for (const auto& Pair : LogicalNodes)
 		{
 			if (UK2Node_IfThenElse* Branch = Cast<UK2Node_IfThenElse>(Pair.Value))
 			{
-				if (Branch->Pins.Num() != 4) bVerified = false;
+				if (Branch->Pins.Num() != 4) bLogicalNodeIdentityExact = false;
 			}
 			else if (UK2Node_CallFunction* Call = Cast<UK2Node_CallFunction>(Pair.Value))
 			{
-				if (Call->GetClass() != UK2Node_CallFunction::StaticClass() || !Call->GetTargetFunction()) bVerified = false;
+				if (Call->GetClass() != UK2Node_CallFunction::StaticClass() || !Call->GetTargetFunction()) bLogicalNodeIdentityExact = false;
 			}
 			else if (UK2Node_Variable* Variable = Cast<UK2Node_Variable>(Pair.Value))
 			{
@@ -2631,19 +2636,30 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 					|| Variable->GetClass() != ExpectedClass
 					|| Variable->VariableReference.GetMemberName() != ExpectedProperty->GetFName()
 					|| !ExactMemberGuid(Variable->VariableReference.GetMemberGuid(), *ExpectedMemberGuid)
-					|| Variable->VariableReference.IsSelfContext() != *bExpectedSelfContext) bVerified = false;
+					|| Variable->VariableReference.IsSelfContext() != *bExpectedSelfContext) bLogicalNodeIdentityExact = false;
 			}
-			else bVerified = false;
+			else bLogicalNodeIdentityExact = false;
 		}
+		if (!bLogicalNodeIdentityExact) bVerified = false;
 		for (const FAppliedOperation& Action : Applied)
 		{
 			if (Action.Kind == EAppliedKind::SetDefault && (!Action.To || Action.To->DefaultValue == Action.PreviousDefault
 				|| (!Action.DefaultCodec.IsValid() && Action.To->DefaultValue != Action.DesiredDefault)
-				|| (Action.DefaultCodec.IsValid() && !QualifiedDefaultRoundTrips(*Action.To, Action.DefaultCodec, Action.To->DefaultValue)))) bVerified = false;
-			if (Action.Kind == EAppliedKind::Connected && (!Action.From || !Action.To || !Action.From->LinkedTo.Contains(Action.To))) bVerified = false;
-			if (Action.Kind == EAppliedKind::Disconnected && (!Action.From || !Action.To || Action.From->LinkedTo.Contains(Action.To))) bVerified = false;
+				|| (Action.DefaultCodec.IsValid() && !QualifiedDefaultRoundTrips(*Action.To, Action.DefaultCodec, Action.To->DefaultValue)))) bAppliedStateExact = false;
+			if (Action.Kind == EAppliedKind::Connected && (!Action.From || !Action.To || !Action.From->LinkedTo.Contains(Action.To))) bAppliedStateExact = false;
+			if (Action.Kind == EAppliedKind::Disconnected && (!Action.From || !Action.To || Action.From->LinkedTo.Contains(Action.To))) bAppliedStateExact = false;
 		}
+		if (!bAppliedStateExact) bVerified = false;
 		TSharedPtr<FJsonObject> VerificationEvidence = Attempt(true, bVerified);
+		VerificationEvidence->SetBoolField(TEXT("topology_exact"), bTopologyExact);
+		VerificationEvidence->SetBoolField(TEXT("topology_v2_exact"), bTopologyV2Exact);
+		VerificationEvidence->SetBoolField(TEXT("node_count_exact"), bNodeCountExact);
+		VerificationEvidence->SetBoolField(TEXT("logical_node_identity_exact"), bLogicalNodeIdentityExact);
+		VerificationEvidence->SetBoolField(TEXT("applied_state_exact"), bAppliedStateExact);
+		VerificationEvidence->SetStringField(TEXT("expected_semantic_fingerprint"),
+			CanonicalExpectedPost.IsValid() ? Sha256(CanonicalJsonObject(CanonicalExpectedPost)) : FString());
+		VerificationEvidence->SetStringField(TEXT("expected_semantic_fingerprint_v2"),
+			CanonicalExpectedPostV2.IsValid() ? Sha256(CanonicalJsonObject(CanonicalExpectedPostV2)) : FString());
 		VerificationEvidence->SetBoolField(TEXT("exact_expected_delta"), bVerified);
 		VerificationEvidence->SetBoolField(TEXT("unchanged_invariants"), bVerified);
 		Evidence->SetObjectField(TEXT("verification"), VerificationEvidence);
