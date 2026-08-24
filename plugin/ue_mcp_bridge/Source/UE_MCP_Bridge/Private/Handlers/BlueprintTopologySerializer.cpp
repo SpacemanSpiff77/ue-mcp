@@ -5,6 +5,8 @@
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraph/EdGraphPin.h"
 #include "EdGraphSchema_K2.h"
+#include "Engine/Blueprint.h"
+#include "Kismet2/BlueprintEditorUtils.h"
 #include "K2Node_CallFunction.h"
 #include "K2Node_DynamicCast.h"
 #include "K2Node_FunctionEntry.h"
@@ -12,6 +14,7 @@
 #include "K2Node_MacroInstance.h"
 #include "K2Node_VariableGet.h"
 #include "K2Node_VariableSet.h"
+#include "UObject/UnrealType.h"
 
 namespace
 {
@@ -28,6 +31,15 @@ namespace
 		FString SortKey;
 		FString Id;
 	};
+
+	FString ExactVariableOwner(UEdGraphNode* Node, const FMemberReference& Reference)
+	{
+		if (const UClass* Parent = Reference.GetMemberParentClass()) return Parent->GetPathName();
+		const UBlueprint* Blueprint = FBlueprintEditorUtils::FindBlueprintForNode(Node);
+		UClass* Scope = Blueprint ? Blueprint->GeneratedClass : nullptr;
+		const FProperty* Property = Scope ? Reference.ResolveMember<FProperty>(Scope) : nullptr;
+		return Property && Property->GetOwnerStruct() ? Property->GetOwnerStruct()->GetPathName() : FString();
+	}
 
 	struct FTopologyConnection
 	{
@@ -241,11 +253,10 @@ UE_MCP_BlueprintTopology::FSerializedGraphTopology UE_MCP_BlueprintTopology::Ser
 		{
 			TSharedPtr<FJsonObject> VariableJson = MakeShared<FJsonObject>();
 			const FMemberReference& Reference = VariableGet->VariableReference;
-			const UClass* Parent = Reference.GetMemberParentClass();
 			const FString Name = Reference.GetMemberName().ToString();
 			VariableJson->SetStringField(TEXT("operation"), TEXT("get"));
 			VariableJson->SetStringField(TEXT("name"), Name);
-			VariableJson->SetStringField(TEXT("owner"), Parent ? Parent->GetPathName() : FString());
+			VariableJson->SetStringField(TEXT("owner"), ExactVariableOwner(Node, Reference));
 			VariableJson->SetBoolField(TEXT("selfContext"), Reference.IsSelfContext());
 			VariableJson->SetStringField(TEXT("memberGuid"), GuidString(Reference.GetMemberGuid()));
 			NodeJson->SetObjectField(TEXT("variable"), VariableJson);
@@ -255,11 +266,10 @@ UE_MCP_BlueprintTopology::FSerializedGraphTopology UE_MCP_BlueprintTopology::Ser
 		{
 			TSharedPtr<FJsonObject> VariableJson = MakeShared<FJsonObject>();
 			const FMemberReference& Reference = VariableSet->VariableReference;
-			const UClass* Parent = Reference.GetMemberParentClass();
 			const FString Name = Reference.GetMemberName().ToString();
 			VariableJson->SetStringField(TEXT("operation"), TEXT("set"));
 			VariableJson->SetStringField(TEXT("name"), Name);
-			VariableJson->SetStringField(TEXT("owner"), Parent ? Parent->GetPathName() : FString());
+			VariableJson->SetStringField(TEXT("owner"), ExactVariableOwner(Node, Reference));
 			VariableJson->SetBoolField(TEXT("selfContext"), Reference.IsSelfContext());
 			VariableJson->SetStringField(TEXT("memberGuid"), GuidString(Reference.GetMemberGuid()));
 			NodeJson->SetObjectField(TEXT("variable"), VariableJson);
