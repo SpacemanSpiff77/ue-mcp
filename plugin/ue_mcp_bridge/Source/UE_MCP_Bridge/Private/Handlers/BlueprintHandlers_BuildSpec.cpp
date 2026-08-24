@@ -1132,25 +1132,55 @@ namespace
 			|| !Payload->TryGetStringField(TEXT("property_type_identity"), TypeIdentity) || !ValidHash(TypeIdentity)
 			|| !Payload->TryGetStringField(TEXT("admission_state"), AdmissionState)
 			|| AdmissionState != TEXT("ADMITTED_FOR_VARIABLE_ACCESS_V1")
-			|| !Payload->TryGetBoolField(TEXT("self_context"), bSelfContext) || !bSelfContext
+			|| !Payload->TryGetBoolField(TEXT("self_context"), bSelfContext)
 			|| !ExpectedType.IsValid()) return nullptr;
 		Payload->TryGetStringField(TEXT("blueprint_member_guid"), MemberGuid);
-		if (!MemberGuid.IsEmpty() || DeclaringOwner.Contains(TEXT(".SKEL_")))
+		const bool bBlueprintDefined = !MemberGuid.IsEmpty() || DeclaringOwner.Contains(TEXT(".SKEL_"));
+		if (bBlueprintDefined != (!MemberGuid.IsEmpty() && DeclaringOwner.Contains(TEXT(".SKEL_"))))
 		{
-			FailureCode = TEXT("BLUEPRINT_PROPERTY_DEFERRED");
+			FailureCode = TEXT("BLUEPRINT_PROPERTY_IDENTITY_MISMATCH");
 			return nullptr;
 		}
 		UClass* OwnerClass = FindObject<UClass>(nullptr, *Owner);
 		if (!OwnerClass) OwnerClass = LoadObject<UClass>(nullptr, *Owner);
 		FProperty* Property = OwnerClass ? FindFProperty<FProperty>(OwnerClass, *Member) : nullptr;
 		FEdGraphPinType LiveType;
-		if (!Property || Property->GetName() != Member || Property->GetOwnerStruct()->GetPathName() != DeclaringOwner
-			|| Property->GetPathName() != AssociatedFieldPath || Property->GetClass()->GetName() != PropertyClass
+		if (!Property || Property->GetName() != Member || Property->GetClass()->GetName() != PropertyClass
 			|| !Property->HasAnyPropertyFlags(CPF_BlueprintVisible)
 			|| !GetDefault<UEdGraphSchema_K2>()->ConvertPropertyToPinType(Property, LiveType)
 			|| !ExactExpectedPinType(ExpectedType, LiveType))
 		{
 			return nullptr;
+		}
+		if (!bBlueprintDefined)
+		{
+			if (!Property->GetOwnerStruct() || Property->GetOwnerStruct()->GetPathName() != DeclaringOwner
+				|| Property->GetPathName() != AssociatedFieldPath) return nullptr;
+		}
+		else
+		{
+			UClass* SkeletonClass = FindObject<UClass>(nullptr, *DeclaringOwner);
+			if (!SkeletonClass) SkeletonClass = LoadObject<UClass>(nullptr, *DeclaringOwner);
+			FProperty* SkeletonProperty = SkeletonClass ? FindFProperty<FProperty>(SkeletonClass, *Member) : nullptr;
+			FGuid SkeletonGuid, LiveGuid;
+			UClass* LiveOwner = Property->GetOwnerClass();
+			UClass* LiveAuthoritative = LiveOwner ? LiveOwner->GetAuthoritativeClass() : nullptr;
+			FEdGraphPinType SkeletonType;
+			const bool bBlueprintIdentity = SkeletonProperty && SkeletonProperty->GetOwnerStruct() == SkeletonClass
+				&& SkeletonProperty->GetPathName() == AssociatedFieldPath
+				&& SkeletonProperty->GetClass()->GetName() == PropertyClass
+				&& GetDefault<UEdGraphSchema_K2>()->ConvertPropertyToPinType(SkeletonProperty, SkeletonType)
+				&& ExactExpectedPinType(ExpectedType, SkeletonType)
+				&& UBlueprint::GetGuidFromClassByFieldName<FProperty>(SkeletonClass, *Member, SkeletonGuid)
+				&& UBlueprint::GetGuidFromClassByFieldName<FProperty>(LiveOwner, *Member, LiveGuid)
+				&& SkeletonGuid.ToString(EGuidFormats::Digits).Equals(MemberGuid, ESearchCase::IgnoreCase)
+				&& LiveGuid.ToString(EGuidFormats::Digits).Equals(MemberGuid, ESearchCase::IgnoreCase)
+				&& LiveAuthoritative && LiveAuthoritative->GetPathName() == Owner;
+			if (!bBlueprintIdentity)
+			{
+				FailureCode = TEXT("BLUEPRINT_PROPERTY_IDENTITY_MISMATCH");
+				return nullptr;
+			}
 		}
 		return Property;
 	}
@@ -1802,6 +1832,8 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		TMap<FString, FProperty*> PlannedVariableProperties;
 		TMap<FString, FProperty*> PlannedLogicalVariableProperties;
 		TMap<FString, bool> PlannedLogicalVariableGets;
+		TMap<FString, bool> PlannedLogicalVariableSelfContexts;
+		TMap<FString, FString> PlannedLogicalVariableMemberGuids;
 		for (const TSharedPtr<FJsonValue>& Value : *Operations)
 		{
 			const TSharedPtr<FJsonObject> PlannedOperation = Value->AsObject();
@@ -1816,7 +1848,8 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			const TSharedPtr<FJsonObject> SpecOperation = SpecById.FindRef(OperationId);
 			const TSharedPtr<FJsonObject> SpecPayload = ObjectField(SpecOperation, TEXT("payload"));
 			const TSharedPtr<FJsonObject> RequestedProperty = ObjectField(SpecPayload, TEXT("property"));
-			FString SpecKind, SpecVersionValue, RequestedOwner, RequestedMember, Owner, Member, Access, LogicalId;
+			FString SpecKind, SpecVersionValue, RequestedOwner, RequestedMember, Owner, Member, MemberGuid, Access, LogicalId;
+			bool bSelfContext = false;
 			if (RequestedProperty.IsValid())
 			{
 				RequestedProperty->TryGetStringField(TEXT("owner"), RequestedOwner);
@@ -1832,6 +1865,8 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 				|| Access != (bGet ? TEXT("GET") : TEXT("SET"))
 				|| !Payload->TryGetStringField(TEXT("authoritative_owner"), Owner) || Owner != RequestedOwner
 				|| !Payload->TryGetStringField(TEXT("native_member"), Member) || Member != RequestedMember
+				|| !Payload->TryGetStringField(TEXT("blueprint_member_guid"), MemberGuid)
+				|| !Payload->TryGetBoolField(TEXT("self_context"), bSelfContext)
 				|| !Payload->TryGetStringField(TEXT("logical_id"), LogicalId) || LogicalId.IsEmpty()
 				|| PlannedLogicalVariableProperties.Contains(LogicalId))
 			{
@@ -1842,15 +1877,17 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			FString PropertyFailure;
 			FProperty* Property = ResolveExactVariableProperty(Payload, PropertyFailure);
 			UClass* OwnerClass = Property ? Cast<UClass>(Property->GetOwnerStruct()) : nullptr;
-			if (!Property || !OwnerClass || !Blueprint->GeneratedClass->IsChildOf(OwnerClass))
+			if (!Property || !OwnerClass || (bSelfContext && !Blueprint->GeneratedClass->IsChildOf(OwnerClass)))
 			{
 				SetFailure(Receipt, TEXT("LIVE_PREFLIGHT"), Property ? TEXT("PROPERTY_OWNER_INCOMPATIBLE") : *PropertyFailure,
-					TEXT("FAILED_PRE_MUTATION"), TEXT("The exact live self-owned FProperty no longer matches the accepted candidate"));
+					TEXT("FAILED_PRE_MUTATION"), TEXT("The exact live FProperty or requested context no longer matches the accepted candidate"));
 				return Complete(Receipt);
 			}
 			PlannedVariableProperties.Add(OperationId, Property);
 			PlannedLogicalVariableProperties.Add(LogicalId, Property);
 			PlannedLogicalVariableGets.Add(LogicalId, bGet);
+			PlannedLogicalVariableSelfContexts.Add(LogicalId, bSelfContext);
+			PlannedLogicalVariableMemberGuids.Add(LogicalId, MemberGuid);
 		}
 
 		for (const TSharedPtr<FJsonValue>& Value : *Operations)
@@ -2244,6 +2281,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			{
 				const bool bGet = Version == TEXT("graph.add-variable-get@1.0");
 				FString LogicalId, CreatedGuid, Owner, Member, MemberGuid, SemanticType;
+				bool bSelfContext = false;
 				double X = 0, Y = 0;
 				const TSharedPtr<FJsonObject> Position = ObjectField(Payload, TEXT("position"));
 				const TSharedPtr<FJsonObject> ExpectedType = ObjectField(Payload, TEXT("property_type"));
@@ -2255,7 +2293,8 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 					&& Payload->TryGetStringField(TEXT("created_node_guid"), CreatedGuid) && FGuid::Parse(CreatedGuid, ParsedGuid)
 					&& Payload->TryGetStringField(TEXT("authoritative_owner"), Owner)
 					&& Payload->TryGetStringField(TEXT("native_member"), Member)
-					&& Payload->TryGetStringField(TEXT("blueprint_member_guid"), MemberGuid) && MemberGuid.IsEmpty()
+					&& Payload->TryGetStringField(TEXT("blueprint_member_guid"), MemberGuid)
+					&& Payload->TryGetBoolField(TEXT("self_context"), bSelfContext)
 					&& Payload->TryGetStringField(TEXT("semantic_type"), SemanticType)
 					&& SemanticType == (bGet ? TEXT("variable-get") : TEXT("variable-set"))
 					&& Position->TryGetNumberField(TEXT("x"), X) && Position->TryGetNumberField(TEXT("y"), Y)
@@ -2267,14 +2306,16 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 						: static_cast<UK2Node_Variable*>(NewObject<UK2Node_VariableSet>(Graph));
 					Variable->NodeGuid = ParsedGuid;
 					Variable->NodePosX = static_cast<int32>(X); Variable->NodePosY = static_cast<int32>(Y);
-					Variable->VariableReference.SetFromField<FProperty>(Property, true);
+					Variable->VariableReference.SetFromField<FProperty>(Property, bSelfContext);
 					Graph->AddNode(Variable, false, false); Variable->AllocateDefaultPins(); Variable->PostPlacedNewNode();
 					LogicalNodes.Add(LogicalId, Variable);
 					Applied.Add({ EAppliedKind::AddedNode, OperationId, Variable });
 					bMutationOccurred = true;
 					bSucceeded = Variable->NodeGuid == ParsedGuid
 						&& Variable->VariableReference.GetMemberName() == Property->GetFName()
-						&& Variable->VariableReference.IsSelfContext();
+						&& Variable->VariableReference.GetMemberGuid().ToString(EGuidFormats::Digits)
+							.Equals(MemberGuid, ESearchCase::IgnoreCase)
+						&& Variable->VariableReference.IsSelfContext() == bSelfContext;
 					for (const TSharedPtr<FJsonValue>& PinValue : *PinExpectations)
 					{
 						const TSharedPtr<FJsonObject> PinExpectation = PinValue->AsObject();
@@ -2304,7 +2345,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 							&& Reference->GetStringField(TEXT("owner")) == Owner
 							&& Reference->GetStringField(TEXT("name")) == Member
 							&& Reference->GetStringField(TEXT("guid")) == MemberGuid
-							&& Reference->GetBoolField(TEXT("self_context"))
+							&& Reference->GetBoolField(TEXT("self_context")) == bSelfContext
 							&& AppendExpectedNode(ExpectedPost, Current, CreatedGuid)
 							&& AppendExpectedNode(ExpectedPostV2, CurrentV2, CreatedGuid);
 						if (bSucceeded) PlannedVariableGuids.Add(CreatedGuid);
@@ -2576,11 +2617,16 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			{
 				FProperty* ExpectedProperty = PlannedLogicalVariableProperties.FindRef(Pair.Key);
 				const bool* bExpectedGet = PlannedLogicalVariableGets.Find(Pair.Key);
+				const bool* bExpectedSelfContext = PlannedLogicalVariableSelfContexts.Find(Pair.Key);
+				const FString* ExpectedMemberGuid = PlannedLogicalVariableMemberGuids.Find(Pair.Key);
 				const UClass* ExpectedClass = bExpectedGet && *bExpectedGet
 					? UK2Node_VariableGet::StaticClass() : UK2Node_VariableSet::StaticClass();
-				if (!ExpectedProperty || !bExpectedGet || Variable->GetClass() != ExpectedClass
+				if (!ExpectedProperty || !bExpectedGet || !bExpectedSelfContext || !ExpectedMemberGuid
+					|| Variable->GetClass() != ExpectedClass
 					|| Variable->VariableReference.GetMemberName() != ExpectedProperty->GetFName()
-					|| !Variable->VariableReference.IsSelfContext()) bVerified = false;
+					|| Variable->VariableReference.GetMemberGuid().ToString(EGuidFormats::Digits)
+						.Compare(*ExpectedMemberGuid, ESearchCase::IgnoreCase) != 0
+					|| Variable->VariableReference.IsSelfContext() != *bExpectedSelfContext) bVerified = false;
 			}
 			else bVerified = false;
 		}

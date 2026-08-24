@@ -34,7 +34,7 @@ describe("atomic Builder Variable/Property Pass 1", () => {
   it("lets Unreal allocate authoritative VariableGet/VariableSet pins and verifies exact identity", () => {
     expect(handler).toContain("NewObject<UK2Node_VariableGet>(Graph)");
     expect(handler).toContain("NewObject<UK2Node_VariableSet>(Graph)");
-    expect(handler).toContain("Variable->VariableReference.SetFromField<FProperty>(Property, true)");
+    expect(handler).toContain("Variable->VariableReference.SetFromField<FProperty>(Property, bSelfContext)");
     expect(handler).toContain("Variable->AllocateDefaultPins()");
     expect(handler).not.toContain("CreatePin(EGPD_");
     expect(handler).toContain("PlannedVariableGuids");
@@ -43,5 +43,14 @@ describe("atomic Builder Variable/Property Pass 1", () => {
     expect(topology).toContain("ExactVariableOwner");
     expect(topology).toContain('SetStringField(TEXT("memberGuid")');
     expect(topology).toContain('SetBoolField(TEXT("selfContext")');
+  });
+
+  it("reuses the same property mechanism for external targets and Blueprint-defined members", () => {
+    expect(handler).toContain('TryGetBoolField(TEXT("self_context"), bSelfContext)');
+    expect(handler).toContain("PlannedLogicalVariableSelfContexts");
+    expect(handler).toContain("UBlueprint::GetGuidFromClassByFieldName<FProperty>");
+    expect(handler).toContain('FailureCode = TEXT("BLUEPRINT_PROPERTY_IDENTITY_MISMATCH")');
+    expect(handler).not.toContain('FailureCode = TEXT("BLUEPRINT_PROPERTY_DEFERRED")');
+    expect(handler).toContain("Variable->VariableReference.IsSelfContext() == bSelfContext");
   });
 });
