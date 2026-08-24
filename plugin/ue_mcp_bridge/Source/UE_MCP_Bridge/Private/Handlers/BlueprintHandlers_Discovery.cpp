@@ -18,6 +18,9 @@
 #include "Misc/EngineVersion.h"
 #include "Misc/Paths.h"
 #include "Interfaces/IPluginManager.h"
+#include "K2Node_BreakStruct.h"
+#include "K2Node_MakeStruct.h"
+#include "K2Node_StructOperation.h"
 #include "UObject/Class.h"
 #include "UObject/Field.h"
 #include "UObject/MetaData.h"
@@ -333,6 +336,19 @@ namespace BlueprintActionDiscovery
 		}
 		UEdGraph* TargetGraph = Contexts.Num() > 0 ? Contexts[0].Graph : nullptr;
 		UEdGraphNode* Template = bStructOperation || bIncludeTemplateEvidence ? Spawner->GetTemplateNode(TargetGraph) : nullptr;
+		if (bStructOperation && TargetGraph)
+		{
+			UK2Node_StructOperation* StructTemplate = Cast<UK2Node_StructOperation>(Template);
+			if (!StructTemplate || StructTemplate->StructType != Struct || StructTemplate->Pins.IsEmpty())
+			{
+				StructTemplate = Spawner->NodeClass->GetName() == TEXT("K2Node_MakeStruct")
+					? static_cast<UK2Node_StructOperation*>(NewObject<UK2Node_MakeStruct>(TargetGraph, NAME_None, RF_Transient))
+					: static_cast<UK2Node_StructOperation*>(NewObject<UK2Node_BreakStruct>(TargetGraph, NAME_None, RF_Transient));
+				StructTemplate->StructType = Struct;
+				StructTemplate->AllocateDefaultPins();
+				Template = StructTemplate;
+			}
+		}
 		if (bStructOperation)
 		{
 			TSharedPtr<FJsonObject> StructJson = MakeShared<FJsonObject>();

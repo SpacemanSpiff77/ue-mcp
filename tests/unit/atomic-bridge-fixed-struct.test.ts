@@ -25,6 +25,7 @@ describe("atomic bridge fixed-struct Pass 1 contract", () => {
     expect(discovery).toContain("UScriptStruct");
     expect(discovery).toContain('TEXT("K2Node_MakeStruct")');
     expect(discovery).toContain('TEXT("K2Node_BreakStruct")');
+    expect(discovery).toContain("StructTemplate->AllocateDefaultPins()");
   });
 
   it("preflights exact identity before constructing dedicated K2 nodes", () => {
