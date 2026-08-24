@@ -69,6 +69,21 @@ namespace
 	const TCHAR* TestHookVersion = TEXT("spacehead.blueprint-atomic-bridge.test-hooks@2.0");
 	const TCHAR* DurableStatusVersion = TEXT("spacehead.blueprint-atomic-bridge.durable-status@1.0");
 
+	bool IsExactBlueprintPackageTarget(const FString& PackagePath, const FString& BlueprintName)
+	{
+		if (BlueprintName.IsEmpty() || !PackagePath.StartsWith(TEXT("/Game/"), ESearchCase::CaseSensitive)
+			|| PackagePath.EndsWith(TEXT("/")) || PackagePath.Contains(TEXT("//"))) return false;
+		int32 LastSlash = INDEX_NONE;
+		if (!PackagePath.FindLastChar(TEXT('/'), LastSlash) || PackagePath.Mid(LastSlash + 1) != BlueprintName)
+			return false;
+		for (int32 Index = 6; Index < PackagePath.Len(); ++Index)
+		{
+			const TCHAR Character = PackagePath[Index];
+			if (Character != TEXT('/') && Character != TEXT('_') && !FChar::IsAlnum(Character)) return false;
+		}
+		return true;
+	}
+
 	struct FCachedAtomicExecution
 	{
 		FString CorrelationId;
@@ -1931,7 +1946,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			|| CanonicalJsonObject(SpecTarget) != CanonicalJsonObject(Target)
 			|| !Target->TryGetStringField(TEXT("package_path"), PackagePath)
 			|| !Target->TryGetStringField(TEXT("blueprint_name"), BlueprintName)
-			|| !PackagePath.StartsWith(TEXT("/Game/Tests/Builder/")) || PackagePath != TEXT("/Game/Tests/Builder/") + BlueprintName
+			|| !IsExactBlueprintPackageTarget(PackagePath, BlueprintName)
 			|| !Operation->TryGetStringField(TEXT("semantic_capability_id"), Capability) || Capability != FunctionAddCapability
 			|| !Operation->TryGetStringField(TEXT("operation_id"), OperationId) || OperationId.IsEmpty()
 			|| !Payload->TryGetStringField(TEXT("function_name"), FunctionName) || FunctionName.IsEmpty()
@@ -2555,8 +2570,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			|| !SpecPolicy.IsValid() || CanonicalJsonObject(SpecTarget) != CanonicalJsonObject(Target)
 			|| !Target->TryGetStringField(TEXT("package_path"), PackagePath)
 			|| !Target->TryGetStringField(TEXT("blueprint_name"), BlueprintName)
-			|| !PackagePath.StartsWith(TEXT("/Game/Tests/Builder/"))
-			|| PackagePath != TEXT("/Game/Tests/Builder/") + BlueprintName
+			|| !IsExactBlueprintPackageTarget(PackagePath, BlueprintName)
 			|| !(*Selectors)[0]->AsObject()->TryGetStringField(TEXT("kind"), SelectorKind) || SelectorKind != TEXT("graph")
 			|| !(*Selectors)[0]->AsObject()->TryGetStringField(TEXT("name"), SelectorName)
 			|| !BuildSpec->TryGetStringField(TEXT("spec_version"), SpecVersion) || SpecVersion != TEXT("spacehead.blueprint-build-spec@1.0")
@@ -3913,8 +3927,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			|| CanonicalJsonObject(SpecTarget) != CanonicalJsonObject(Target)
 			|| !Target->TryGetStringField(TEXT("package_path"), PackagePath)
 			|| !Target->TryGetStringField(TEXT("blueprint_name"), BlueprintName)
-			|| !PackagePath.StartsWith(TEXT("/Game/Tests/Builder/"))
-			|| PackagePath != TEXT("/Game/Tests/Builder/") + BlueprintName
+			|| !IsExactBlueprintPackageTarget(PackagePath, BlueprintName)
 			|| !Operation->TryGetStringField(TEXT("semantic_capability_id"), Capability) || Capability != ExpectedCapability
 			|| !Operation->TryGetStringField(TEXT("operation_id"), OperationId) || OperationId.IsEmpty()
 			|| !(*Selectors)[0]->AsObject()->TryGetStringField(TEXT("kind"), SelectorKind)
@@ -4479,8 +4492,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 	if (!Target.IsValid() || !Selectors || Selectors->Num() != 1 || !Operation.IsValid() || !Payload.IsValid()
 		|| !Target->TryGetStringField(TEXT("package_path"), PackagePath)
 		|| !Target->TryGetStringField(TEXT("blueprint_name"), BlueprintName)
-		|| !PackagePath.StartsWith(TEXT("/Game/Tests/Builder/"))
-		|| PackagePath != TEXT("/Game/Tests/Builder/") + BlueprintName
+		|| !IsExactBlueprintPackageTarget(PackagePath, BlueprintName)
 		|| !Operation->TryGetStringField(TEXT("semantic_capability_id"), Capability) || Capability != SemanticCapability
 		|| !Operation->TryGetStringField(TEXT("operation_version"), Version) || Version != OperationVersion
 		|| !(*Selectors)[0]->AsObject()->TryGetStringField(TEXT("kind"), SelectorKind)

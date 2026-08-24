@@ -17,6 +17,14 @@ describe("atomic Builder Stage B minimum graph vocabulary", () => {
     expect(handler).toContain('const TCHAR* RawMethodIdentity = TEXT("apply_atomic_build_plan")');
   });
 
+  it("accepts only exact canonical Game package targets while fault hooks remain test-scoped", () => {
+    expect(handler.match(/IsExactBlueprintPackageTarget\(PackagePath, BlueprintName\)/g)).toHaveLength(4);
+    expect(handler).toContain('PackagePath.StartsWith(TEXT("/Game/"), ESearchCase::CaseSensitive)');
+    expect(handler).toContain('PackagePath.Mid(LastSlash + 1) != BlueprintName');
+    expect(handler).toContain('ProjectName.Equals(TEXT("ue_mcp")');
+    expect(handler).toContain('PackagePath.StartsWith(TEXT("/Game/Tests/Builder/"))');
+  });
+
   it("uses direct deterministic graph/schema APIs with no conversion or promotion behavior", () => {
     expect(handler).toContain("NewObject<UK2Node_IfThenElse>(Graph)");
     expect(handler).toContain("Branch->NodeGuid = ParsedCreatedGuid");
