@@ -35,6 +35,8 @@ describe("atomic Builder Variable/Property Pass 1", () => {
     expect(handler).toContain("NewObject<UK2Node_VariableGet>(Graph)");
     expect(handler).toContain("NewObject<UK2Node_VariableSet>(Graph)");
     expect(handler).toContain("Variable->VariableReference.SetFromField<FProperty>(Property, bSelfContext)");
+    expect(handler).toContain("ExactMemberGuid(Variable->VariableReference.GetMemberGuid(), MemberGuid)");
+    expect(handler).toContain("Expected.IsEmpty()");
     expect(handler).toContain("Variable->AllocateDefaultPins()");
     expect(handler).not.toContain("CreatePin(EGPD_");
     expect(handler).toContain("PlannedVariableGuids");

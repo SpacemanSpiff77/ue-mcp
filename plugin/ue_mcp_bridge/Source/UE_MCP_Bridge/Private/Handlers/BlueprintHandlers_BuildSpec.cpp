@@ -260,6 +260,13 @@ namespace
 		return true;
 	}
 
+	bool ExactMemberGuid(const FGuid& Actual, const FString& Expected)
+	{
+		return Expected.IsEmpty()
+			? !Actual.IsValid()
+			: Actual.IsValid() && Actual.ToString(EGuidFormats::Digits).Equals(Expected, ESearchCase::IgnoreCase);
+	}
+
 	bool AtomicSchemaDigest(const TCHAR* FileName, const TCHAR* ExpectedVersion, FString& Digest)
 	{
 		const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("UE_MCP_Bridge"));
@@ -2313,8 +2320,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 					bMutationOccurred = true;
 					bSucceeded = Variable->NodeGuid == ParsedGuid
 						&& Variable->VariableReference.GetMemberName() == Property->GetFName()
-						&& Variable->VariableReference.GetMemberGuid().ToString(EGuidFormats::Digits)
-							.Equals(MemberGuid, ESearchCase::IgnoreCase)
+						&& ExactMemberGuid(Variable->VariableReference.GetMemberGuid(), MemberGuid)
 						&& Variable->VariableReference.IsSelfContext() == bSelfContext;
 					for (const TSharedPtr<FJsonValue>& PinValue : *PinExpectations)
 					{
@@ -2624,8 +2630,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 				if (!ExpectedProperty || !bExpectedGet || !bExpectedSelfContext || !ExpectedMemberGuid
 					|| Variable->GetClass() != ExpectedClass
 					|| Variable->VariableReference.GetMemberName() != ExpectedProperty->GetFName()
-					|| Variable->VariableReference.GetMemberGuid().ToString(EGuidFormats::Digits)
-						.Compare(*ExpectedMemberGuid, ESearchCase::IgnoreCase) != 0
+					|| !ExactMemberGuid(Variable->VariableReference.GetMemberGuid(), *ExpectedMemberGuid)
 					|| Variable->VariableReference.IsSelfContext() != *bExpectedSelfContext) bVerified = false;
 			}
 			else bVerified = false;
