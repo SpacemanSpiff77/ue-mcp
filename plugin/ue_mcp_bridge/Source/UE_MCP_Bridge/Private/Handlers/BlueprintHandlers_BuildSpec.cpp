@@ -22,6 +22,7 @@
 #include "Misc/EngineVersion.h"
 #include "Misc/App.h"
 #include "Misc/FileHelper.h"
+#include "Misc/DefaultValueHelper.h"
 #include "Misc/Paths.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -976,11 +977,11 @@ namespace
 		{
 			double Pitch = 0, Yaw = 0, Roll = 0;
 			FRotator Parsed = FRotator::ZeroRotator;
-			const TCHAR* End = Struct == TBaseStructure<FRotator>::Get()
-				? Struct->ImportText(*Value, &Parsed, nullptr, PPF_None, nullptr, TEXT("Rotator")) : nullptr;
+			const bool bParsed = Struct == TBaseStructure<FRotator>::Get()
+				&& FDefaultValueHelper::ParseRotator(Value, Parsed);
 			return Category == TEXT("struct") && Semantic.IsValid() && Semantic->Values.Num() == 3
 				&& Semantic->TryGetNumberField(TEXT("pitch"), Pitch) && Semantic->TryGetNumberField(TEXT("yaw"), Yaw)
-				&& Semantic->TryGetNumberField(TEXT("roll"), Roll) && End && *End == 0
+				&& Semantic->TryGetNumberField(TEXT("roll"), Roll) && bParsed
 				&& Parsed.Pitch == Pitch && Parsed.Yaw == Yaw && Parsed.Roll == Roll;
 		}
 		return false;
