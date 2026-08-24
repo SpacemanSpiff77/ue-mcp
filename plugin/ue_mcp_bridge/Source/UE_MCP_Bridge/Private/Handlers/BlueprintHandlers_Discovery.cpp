@@ -20,6 +20,7 @@
 #include "Interfaces/IPluginManager.h"
 #include "K2Node_BreakStruct.h"
 #include "K2Node_MakeStruct.h"
+#include "K2Node_SetFieldsInStruct.h"
 #include "K2Node_StructOperation.h"
 #include "UObject/Class.h"
 #include "UObject/Field.h"
@@ -297,7 +298,8 @@ namespace BlueprintActionDiscovery
 		UScriptStruct* Struct = Cast<UScriptStruct>(AssociatedField.ToUObject());
 		if (!Struct) Struct = Cast<UScriptStruct>(const_cast<UObject*>(ActionOwner));
 		const bool bStructOperation = Struct && (Spawner->NodeClass->GetName() == TEXT("K2Node_MakeStruct")
-			|| Spawner->NodeClass->GetName() == TEXT("K2Node_BreakStruct"));
+			|| Spawner->NodeClass->GetName() == TEXT("K2Node_BreakStruct")
+			|| Spawner->NodeClass->GetName() == TEXT("K2Node_SetFieldsInStruct"));
 		const FString ActionOwnerPath = ActionOwner->GetPathName();
 		const FBlueprintNodeSignature Signature = Spawner->GetSpawnerSignature();
 		TSharedPtr<FJsonObject> Action = MakeShared<FJsonObject>();
@@ -341,9 +343,12 @@ namespace BlueprintActionDiscovery
 			UK2Node_StructOperation* StructTemplate = Cast<UK2Node_StructOperation>(Template);
 			if (!StructTemplate || StructTemplate->StructType != Struct || StructTemplate->Pins.IsEmpty())
 			{
-				StructTemplate = Spawner->NodeClass->GetName() == TEXT("K2Node_MakeStruct")
-					? static_cast<UK2Node_StructOperation*>(NewObject<UK2Node_MakeStruct>(TargetGraph, NAME_None, RF_Transient))
-					: static_cast<UK2Node_StructOperation*>(NewObject<UK2Node_BreakStruct>(TargetGraph, NAME_None, RF_Transient));
+				if (Spawner->NodeClass->GetName() == TEXT("K2Node_MakeStruct"))
+					StructTemplate = NewObject<UK2Node_MakeStruct>(TargetGraph, NAME_None, RF_Transient);
+				else if (Spawner->NodeClass->GetName() == TEXT("K2Node_BreakStruct"))
+					StructTemplate = NewObject<UK2Node_BreakStruct>(TargetGraph, NAME_None, RF_Transient);
+				else
+					StructTemplate = NewObject<UK2Node_SetFieldsInStruct>(TargetGraph, NAME_None, RF_Transient);
 				StructTemplate->StructType = Struct;
 				StructTemplate->AllocateDefaultPins();
 				Template = StructTemplate;

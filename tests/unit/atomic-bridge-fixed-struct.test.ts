@@ -9,16 +9,18 @@ const discovery = read("plugin/ue_mcp_bridge/Source/UE_MCP_Bridge/Private/Handle
 const topology = read("plugin/ue_mcp_bridge/Source/UE_MCP_Bridge/Private/Handlers/BlueprintTopologySerializer.cpp");
 const request = JSON.parse(read("plugin/ue_mcp_bridge/Contracts/AtomicBlueprint/request-v2.schema.json"));
 
-describe("atomic bridge fixed-struct Pass 1 contract", () => {
-  it("advertises only the two fixed struct operations", () => {
+describe("atomic bridge fixed-struct contract", () => {
+  it("advertises the qualified fixed struct operations", () => {
     const wire = JSON.stringify(request);
     expect(wire).toContain("graph.add-make-struct");
     expect(wire).toContain("graph.add-break-struct");
     expect(wire).toContain("graph.add-make-struct@1.0");
     expect(wire).toContain("graph.add-break-struct@1.0");
-    expect(wire).not.toContain("set-members-in-struct");
+    expect(wire).toContain("graph.add-set-members-in-struct");
+    expect(wire).toContain("graph.add-set-members-in-struct@1.0");
     expect(handler).toContain("CapabilityJson(MakeStructCapability)");
     expect(handler).toContain("CapabilityJson(BreakStructCapability)");
+    expect(handler).toContain("CapabilityJson(SetMembersInStructCapability)");
   });
 
   it("discovers exact reflected struct identity and template pin evidence", () => {
@@ -27,6 +29,7 @@ describe("atomic bridge fixed-struct Pass 1 contract", () => {
     expect(discovery).toContain("UScriptStruct");
     expect(discovery).toContain('TEXT("K2Node_MakeStruct")');
     expect(discovery).toContain('TEXT("K2Node_BreakStruct")');
+    expect(discovery).toContain('TEXT("K2Node_SetFieldsInStruct")');
     expect(discovery).toContain("StructTemplate->AllocateDefaultPins()");
   });
 
@@ -35,9 +38,11 @@ describe("atomic bridge fixed-struct Pass 1 contract", () => {
     expect(handler).toContain("/Script/BlueprintGraph.BlueprintFieldNodeSpawner");
     expect(handler).toContain("UK2Node_MakeStruct");
     expect(handler).toContain("UK2Node_BreakStruct");
+    expect(handler).toContain("UK2Node_SetFieldsInStruct");
+    expect(handler).toContain("ShowPinForProperties");
     expect(handler).toContain("StructNode->StructType = Struct");
-    expect(handler).toContain('ExpectedAggregate.bIsReference = Operation == TEXT("BREAK")');
-    expect(handler).toContain('ExpectedAggregate.bIsConst = Operation == TEXT("BREAK")');
+    expect(handler).toContain("Live.bIsReference = bReference");
+    expect(handler).toContain("Live.bIsConst = bConst");
     expect(handler.indexOf("ResolveExactStructOperation"))
       .toBeLessThan(handler.indexOf("StructNode->StructType = Struct"));
   });
@@ -45,6 +50,8 @@ describe("atomic bridge fixed-struct Pass 1 contract", () => {
   it("serializes independent class and struct-operation readback", () => {
     expect(topology).toContain('TEXT("make-struct")');
     expect(topology).toContain('TEXT("break-struct")');
+    expect(topology).toContain('TEXT("set-members-in-struct")');
+    expect(topology).toContain('TEXT("selectedMembers")');
     expect(topology).toContain('TEXT("structOperation")');
     expect(topology).toContain('TEXT("typePath")');
   });
