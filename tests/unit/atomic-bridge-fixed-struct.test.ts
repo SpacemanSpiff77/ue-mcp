@@ -36,6 +36,8 @@ describe("atomic bridge fixed-struct Pass 1 contract", () => {
     expect(handler).toContain("UK2Node_MakeStruct");
     expect(handler).toContain("UK2Node_BreakStruct");
     expect(handler).toContain("StructNode->StructType = Struct");
+    expect(handler).toContain('ExpectedAggregate.bIsReference = Operation == TEXT("BREAK")');
+    expect(handler).toContain('ExpectedAggregate.bIsConst = Operation == TEXT("BREAK")');
     expect(handler.indexOf("ResolveExactStructOperation"))
       .toBeLessThan(handler.indexOf("StructNode->StructType = Struct"));
   });

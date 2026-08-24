@@ -1245,6 +1245,8 @@ namespace
 		FEdGraphPinType ExpectedAggregate;
 		ExpectedAggregate.PinCategory = UEdGraphSchema_K2::PC_Struct;
 		ExpectedAggregate.PinSubCategoryObject = Struct;
+		ExpectedAggregate.bIsReference = Operation == TEXT("BREAK");
+		ExpectedAggregate.bIsConst = Operation == TEXT("BREAK");
 		if (!Aggregate->TryGetStringField(TEXT("direction"), AggregateDirection)
 			|| AggregateDirection != (Operation == TEXT("MAKE") ? TEXT("output") : TEXT("input"))
 			|| !ExactExpectedPinType(AggregateType, ExpectedAggregate)) return nullptr;
