@@ -29,7 +29,7 @@ describe("atomic Builder Pass 3 recovery boundary", () => {
     expect(handler).toContain("Handle->Flush(true)");
   });
 
-  it("gates every fault checkpoint to the versioned ue_mcp disposable test project contract", () => {
+  it("gates fault checkpoints to the general test project plus the exact Phase E rollback probe", () => {
     const hooks = request.$defs.testHooks;
     expect(hooks.required).toEqual(["test_hook_version", "checkpoint"]);
     expect(hooks.additionalProperties).toBe(false);
@@ -40,9 +40,11 @@ describe("atomic Builder Pass 3 recovery boundary", () => {
       "AFTER_COMPILE_BEFORE_VERIFY", "VERIFICATION_FAILURE", "AFTER_VERIFY_BEFORE_SAVE", "SAVE_FAILURE",
       "AFTER_SAVE_BEFORE_FINAL_RECEIPT", "ROLLBACK_FAILURE",
     ]));
-    expect(handler).toContain('FApp::GetProjectName()).Equals(TEXT("ue_mcp")');
+    expect(handler).toContain('ProjectName.Equals(TEXT("ue_mcp")');
     expect(handler).toContain('PackagePath.StartsWith(TEXT("/Game/Tests/Builder/"))');
-    expect(handler).toContain("Hooks->Values.Num() == 2");
+    expect(handler).toContain("Hooks->Values.Num() != 2");
+    expect(handler).toContain('PackagePath == TEXT("/Game/Tests/Builder/BP_PhaseE_WholeFunction")');
+    expect(handler).toContain('Checkpoint == TEXT("AFTER_FINAL_MUTATION")');
     expect(handler).not.toContain("RequestExit(");
     expect(handler).not.toContain("TerminateProc(");
   });

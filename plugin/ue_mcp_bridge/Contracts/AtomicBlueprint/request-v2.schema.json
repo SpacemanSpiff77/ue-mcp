@@ -35,8 +35,16 @@
         { "type": "object", "additionalProperties": false, "required": ["kind", "node_guid"],
           "properties": { "kind": { "const": "existing" }, "node_guid": { "$ref": "#/$defs/nonEmpty" } } },
         { "type": "object", "additionalProperties": false, "required": ["kind", "logical_id"],
-          "properties": { "kind": { "const": "logical" }, "logical_id": { "$ref": "#/$defs/nonEmpty" } } }
+          "properties": { "kind": { "const": "logical" }, "logical_id": { "$ref": "#/$defs/nonEmpty" } } },
+        { "type": "object", "additionalProperties": false, "required": ["kind", "function_operation_id"],
+          "properties": { "kind": { "enum": ["function_entry", "function_return"] },
+            "function_operation_id": { "$ref": "#/$defs/nonEmpty" } } }
       ]
+    },
+    "createdFunctionGraphReference": {
+      "type": "object", "additionalProperties": false, "required": ["kind", "function_operation_id"],
+      "properties": { "kind": { "const": "created_function" },
+        "function_operation_id": { "$ref": "#/$defs/nonEmpty" } }
     },
     "pinReference": {
       "type": "object", "additionalProperties": false,
@@ -56,6 +64,7 @@
         "kind": { "enum": ["add_node", "add_variable_get", "add_variable_set", "add_function", "set_pin_default", "connect_pins", "disconnect_pins"] },
         "operation_version": { "enum": ["function.add@1.0", "graph.add-node@1.0", "graph.add-call-function-standard@1.0", "graph.add-variable-get@1.0", "graph.add-variable-set@1.0", "graph.add-make-struct@1.0", "graph.add-break-struct@1.0", "graph.add-set-members-in-struct@1.0", "graph.set-pin-default@1.0", "graph.connect-pins@1.0", "graph.disconnect-pins@1.0"] },
         "depends_on": { "type": "array", "maxItems": 7, "uniqueItems": true, "items": { "$ref": "#/$defs/nonEmpty" } },
+        "graph": { "$ref": "#/$defs/createdFunctionGraphReference" },
         "payload": { "type": "object" }
       }
     },
@@ -79,9 +88,19 @@
         "capability_version": { "const": "1.0" },
         "operation_version": { "enum": ["function.add@1.0", "graph.add-node@1.0", "graph.add-call-function-standard@1.0", "graph.add-variable-get@1.0", "graph.add-variable-set@1.0", "graph.add-make-struct@1.0", "graph.add-break-struct@1.0", "graph.add-set-members-in-struct@1.0", "graph.set-pin-default@1.0", "graph.connect-pins@1.0", "graph.disconnect-pins@1.0"] },
         "depends_on": { "type": "array", "maxItems": 7, "uniqueItems": true, "items": { "$ref": "#/$defs/nonEmpty" } },
-        "target_graph_identity": { "type": "object" },
+        "target_graph_identity": { "oneOf": [
+          { "type": "object", "additionalProperties": false, "required": ["kind", "guid"],
+            "properties": { "kind": { "const": "existing" }, "guid": { "$ref": "#/$defs/nonEmpty" } } },
+          { "$ref": "#/$defs/createdFunctionGraphReference" }
+        ] },
         "existing_node_identities": { "type": "array", "maxItems": 2 },
-        "future_node_identities": { "type": "array", "maxItems": 2 },
+        "future_node_identities": { "type": "array", "maxItems": 2, "items": { "oneOf": [
+          { "type": "object", "additionalProperties": false, "required": ["kind", "logical_id"],
+            "properties": { "kind": { "const": "logical" }, "logical_id": { "$ref": "#/$defs/nonEmpty" } } },
+          { "type": "object", "additionalProperties": false, "required": ["kind", "function_operation_id"],
+            "properties": { "kind": { "enum": ["function_entry", "function_return"] },
+              "function_operation_id": { "$ref": "#/$defs/nonEmpty" } } }
+        ] } },
         "pin_expectations": { "type": "array", "maxItems": 4 },
         "semantic_payload": { "type": "object" }
       }

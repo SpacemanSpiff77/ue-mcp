@@ -56,6 +56,7 @@ namespace
 	const TCHAR* BreakStructCapability = TEXT("graph.add-break-struct");
 	const TCHAR* SetMembersInStructCapability = TEXT("graph.add-set-members-in-struct");
 	const TCHAR* FunctionAddCapability = TEXT("function.add");
+	const TCHAR* WholeFunctionComposeCapability = TEXT("function.compose-created-body");
 	const TCHAR* CapabilityVersion = TEXT("1.0");
 	const TCHAR* OperationVersion = TEXT("graph.set-pin-default@1.0");
 	const TCHAR* HandlerVersion = TEXT("spacehead.graph.set-pin-default-handler@1.0");
@@ -1444,7 +1445,7 @@ namespace
 	}
 
 	bool ExactFunctionShell(UEdGraph* Graph, const TArray<TSharedPtr<FJsonValue>>* Inputs,
-		const TArray<TSharedPtr<FJsonValue>>* Outputs)
+		const TArray<TSharedPtr<FJsonValue>>* Outputs, int32 ExpectedBodyNodes = 0)
 	{
 		if (!Graph || !Inputs || !Outputs) return false;
 		TArray<UK2Node_FunctionEntry*> Entries;
@@ -1452,7 +1453,7 @@ namespace
 		Graph->GetNodesOfClass(Entries);
 		Graph->GetNodesOfClass(Results);
 		if (Entries.Num() != 1 || Results.Num() != (Outputs->Num() > 0 ? 1 : 0)
-			|| Graph->Nodes.Num() != Entries.Num() + Results.Num()) return false;
+			|| Graph->Nodes.Num() != Entries.Num() + Results.Num() + ExpectedBodyNodes) return false;
 		auto ExactPins = [](const UK2Node_EditablePinBase* Node, const TArray<TSharedPtr<FJsonValue>>& Expected,
 			EEdGraphPinDirection Direction)
 		{
@@ -1646,12 +1647,17 @@ namespace
 	{
 		if (!Hooks.IsValid()) return true;
 		FString Version;
-		return FString(FApp::GetProjectName()).Equals(TEXT("ue_mcp"), ESearchCase::CaseSensitive)
-			&& PackagePath.StartsWith(TEXT("/Game/Tests/Builder/"))
-			&& Hooks->Values.Num() == 2
-			&& Hooks->TryGetStringField(TEXT("test_hook_version"), Version) && Version == TestHookVersion
-			&& Hooks->TryGetStringField(TEXT("checkpoint"), Checkpoint)
-			&& IsKnownFaultCheckpoint(Checkpoint);
+		if (Hooks->Values.Num() != 2
+			|| !Hooks->TryGetStringField(TEXT("test_hook_version"), Version) || Version != TestHookVersion
+			|| !Hooks->TryGetStringField(TEXT("checkpoint"), Checkpoint)
+			|| !IsKnownFaultCheckpoint(Checkpoint)) return false;
+		const FString ProjectName = FApp::GetProjectName();
+		const bool bGeneralTestProject = ProjectName.Equals(TEXT("ue_mcp"), ESearchCase::CaseSensitive)
+			&& PackagePath.StartsWith(TEXT("/Game/Tests/Builder/"));
+		const bool bPhaseEProjectXProbe = ProjectName.Equals(TEXT("ProjectX"), ESearchCase::CaseSensitive)
+			&& PackagePath == TEXT("/Game/Tests/Builder/BP_PhaseE_WholeFunction")
+			&& Checkpoint == TEXT("AFTER_FINAL_MUTATION");
+		return bGeneralTestProject || bPhaseEProjectXProbe;
 	}
 
 	TSharedPtr<FJsonObject> Readiness()
@@ -1727,6 +1733,7 @@ namespace
 			CapabilityJson(BreakStructCapability),
 			CapabilityJson(SetMembersInStructCapability),
 			CapabilityJson(FunctionAddCapability),
+			CapabilityJson(WholeFunctionComposeCapability),
 		});
 		return Result;
 	}
@@ -1769,6 +1776,10 @@ namespace
 	}
 }
 
+// This dispatcher intentionally owns the complete atomic lifecycle so no request can
+// escape its rollback boundary. Its generated validation branches exceed MSVC's
+// optimizer size threshold; compiling it unoptimized avoids C4883 under /WX.
+UE_DISABLE_OPTIMIZATION
 TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr<FJsonObject>& Params)
 {
 	FString Contract;
@@ -1889,7 +1900,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 	const TArray<TSharedPtr<FJsonValue>>* Selectors = ArrayField(Target, TEXT("graph_selectors"));
 	const TArray<TSharedPtr<FJsonValue>>* Operations = ArrayField(Plan, TEXT("operations"));
 	FString FirstOperationVersion;
-	if (Operations && Operations->Num() == 1 && (*Operations)[0]->AsObject().IsValid())
+	if (Operations && Operations->Num() >= 1 && (*Operations)[0]->AsObject().IsValid())
 		(*Operations)[0]->AsObject()->TryGetStringField(TEXT("operation_version"), FirstOperationVersion);
 	if (FirstOperationVersion == TEXT("function.add@1.0"))
 	{
@@ -1897,7 +1908,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		const TSharedPtr<FJsonObject> Payload = ObjectField(Operation, TEXT("semantic_payload"));
 		const TSharedPtr<FJsonObject> SpecTarget = ObjectField(BuildSpec, TEXT("target"));
 		const TArray<TSharedPtr<FJsonValue>>* SpecOperations = ArrayField(BuildSpec, TEXT("operations"));
-		const TSharedPtr<FJsonObject> SpecOperation = SpecOperations && SpecOperations->Num() == 1 ? (*SpecOperations)[0]->AsObject() : nullptr;
+		const TSharedPtr<FJsonObject> SpecOperation = SpecOperations && SpecOperations->Num() >= 1 ? (*SpecOperations)[0]->AsObject() : nullptr;
 		const TSharedPtr<FJsonObject> SpecPayload = ObjectField(SpecOperation, TEXT("payload"));
 		const TSharedPtr<FJsonObject> SpecPolicy = ObjectField(BuildSpec, TEXT("policy"));
 		const TArray<TSharedPtr<FJsonValue>>* BaselineInventory = ArrayField(Payload, TEXT("baseline_graph_inventory"));
@@ -1914,6 +1925,8 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		bool bCompileWithoutSave = false, bSaveAfterVerification = false, bRollbackOnFailure = false;
 		const bool bHasOutputs = Outputs && Outputs->Num() > 0;
 		if (!Target.IsValid() || !SpecTarget.IsValid() || !Selectors || Selectors->Num() != 0
+			|| !Operations || Operations->Num() < 1 || Operations->Num() > 8
+			|| !SpecOperations || SpecOperations->Num() != Operations->Num()
 			|| !Operation.IsValid() || !Payload.IsValid() || !SpecOperation.IsValid() || !SpecPayload.IsValid() || !SpecPolicy.IsValid()
 			|| CanonicalJsonObject(SpecTarget) != CanonicalJsonObject(Target)
 			|| !Target->TryGetStringField(TEXT("package_path"), PackagePath)
@@ -1949,6 +1962,215 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		{
 			SetFailure(Receipt, TEXT("SPEC"), TEXT("BUILD_SPEC_PLAN_MISMATCH"), TEXT("FAILED_PRE_MUTATION"),
 				TEXT("Function BuildSpec and deterministic function-shell BuildPlan do not match"));
+			return Complete(Receipt);
+		}
+
+		// Preflight the complete future function before any UObject mutation. The model contains only
+		// semantic terminal identities and logical body-node identities; no runtime graph GUID is input.
+		TMap<FString, UFunction*> PlannedWholeCallFunctions;
+		TMap<FString, FString> LogicalOperationIds;
+		TMap<FString, TMap<FString, FString>> FuturePins;
+		TSet<FString> ClaimedFuturePins;
+		auto PinKey = [](const FString& Direction, const FString& Name) { return Direction + TEXT(":") + Name; };
+		auto ParameterCategory = [](const FString& Type) { return Type == TEXT("float") ? FString(TEXT("real")) : Type; };
+		TMap<FString, FString> EntryPins;
+		EntryPins.Add(PinKey(TEXT("output"), TEXT("then")), TEXT("exec"));
+		for (const TSharedPtr<FJsonValue>& Value : *Inputs)
+		{
+			const TSharedPtr<FJsonObject> Parameter = Value->AsObject();
+			FString Name, Type;
+			if (!Parameter.IsValid() || !Parameter->TryGetStringField(TEXT("name"), Name)
+				|| !Parameter->TryGetStringField(TEXT("type"), Type))
+			{
+				SetFailure(Receipt, TEXT("LIVE_PREFLIGHT"), TEXT("FUTURE_TERMINAL_INVALID"), TEXT("FAILED_PRE_MUTATION"),
+					TEXT("Function Entry terminal simulation is invalid"));
+				return Complete(Receipt);
+			}
+			EntryPins.Add(PinKey(TEXT("output"), Name), ParameterCategory(Type));
+		}
+		FuturePins.Add(TEXT("entry:") + OperationId, EntryPins);
+		if (bHasOutputs)
+		{
+			TMap<FString, FString> ReturnPins;
+			ReturnPins.Add(PinKey(TEXT("input"), TEXT("execute")), TEXT("exec"));
+			for (const TSharedPtr<FJsonValue>& Value : *Outputs)
+			{
+				const TSharedPtr<FJsonObject> Parameter = Value->AsObject();
+				FString Name, Type;
+				if (!Parameter.IsValid() || !Parameter->TryGetStringField(TEXT("name"), Name)
+					|| !Parameter->TryGetStringField(TEXT("type"), Type))
+				{
+					SetFailure(Receipt, TEXT("LIVE_PREFLIGHT"), TEXT("FUTURE_TERMINAL_INVALID"), TEXT("FAILED_PRE_MUTATION"),
+						TEXT("Function Return terminal simulation is invalid"));
+					return Complete(Receipt);
+				}
+				ReturnPins.Add(PinKey(TEXT("input"), Name), ParameterCategory(Type));
+			}
+			FuturePins.Add(TEXT("return:") + OperationId, ReturnPins);
+		}
+		auto ContainsDependency = [](const TArray<TSharedPtr<FJsonValue>>* Dependencies, const FString& Id)
+		{
+			if (!Dependencies) return false;
+			for (const TSharedPtr<FJsonValue>& Value : *Dependencies) if (Value.IsValid() && Value->AsString() == Id) return true;
+			return false;
+		};
+		auto ReferenceKey = [&](const TSharedPtr<FJsonObject>& Reference, FString& OutKey)
+		{
+			FString Kind, Identity;
+			if (!Reference.IsValid() || !Reference->TryGetStringField(TEXT("kind"), Kind)) return false;
+			if (Kind == TEXT("logical") && Reference->TryGetStringField(TEXT("logical_id"), Identity)
+				&& FuturePins.Contains(TEXT("logical:") + Identity)) { OutKey = TEXT("logical:") + Identity; return true; }
+			if (Kind == TEXT("function_entry") && Reference->TryGetStringField(TEXT("function_operation_id"), Identity)
+				&& Identity == OperationId) { OutKey = TEXT("entry:") + Identity; return true; }
+			if (Kind == TEXT("function_return") && Reference->TryGetStringField(TEXT("function_operation_id"), Identity)
+				&& Identity == OperationId && bHasOutputs) { OutKey = TEXT("return:") + Identity; return true; }
+			return false;
+		};
+		bool bWholeFunctionPreflight = true;
+		FString WholeFunctionPreflightFailure = TEXT("UNKNOWN_BODY_PREFLIGHT_MISMATCH");
+		for (int32 Index = 1; Index < Operations->Num() && bWholeFunctionPreflight; ++Index)
+		{
+			const TSharedPtr<FJsonObject> Body = (*Operations)[Index]->AsObject();
+			const TSharedPtr<FJsonObject> BodyPayload = ObjectField(Body, TEXT("semantic_payload"));
+			const TSharedPtr<FJsonObject> BodySpec = (*SpecOperations)[Index]->AsObject();
+			const TSharedPtr<FJsonObject> BodySpecPayload = ObjectField(BodySpec, TEXT("payload"));
+			const TSharedPtr<FJsonObject> TargetGraph = ObjectField(Body, TEXT("target_graph_identity"));
+			const TSharedPtr<FJsonObject> SpecGraph = ObjectField(BodySpec, TEXT("graph"));
+			const TArray<TSharedPtr<FJsonValue>>* Dependencies = ArrayField(Body, TEXT("depends_on"));
+			const TArray<TSharedPtr<FJsonValue>>* SpecDependencies = ArrayField(BodySpec, TEXT("depends_on"));
+			FString BodyId, BodyVersion, BodyCapability, SpecBodyId, SpecBodyVersion, SpecKindValue;
+			FString GraphKind, GraphCreator, SpecGraphKind, SpecGraphCreator;
+			bWholeFunctionPreflight = Body.IsValid() && BodyPayload.IsValid() && BodySpec.IsValid() && BodySpecPayload.IsValid()
+				&& Body->TryGetStringField(TEXT("operation_id"), BodyId) && !BodyId.IsEmpty()
+				&& BodySpec->TryGetStringField(TEXT("operation_id"), SpecBodyId) && SpecBodyId == BodyId
+				&& Body->TryGetStringField(TEXT("operation_version"), BodyVersion)
+				&& BodySpec->TryGetStringField(TEXT("operation_version"), SpecBodyVersion) && SpecBodyVersion == BodyVersion
+				&& Body->TryGetStringField(TEXT("semantic_capability_id"), BodyCapability)
+				&& BodySpec->TryGetStringField(TEXT("kind"), SpecKindValue)
+				&& TargetGraph.IsValid() && TargetGraph->TryGetStringField(TEXT("kind"), GraphKind)
+				&& GraphKind == TEXT("created_function")
+				&& TargetGraph->TryGetStringField(TEXT("function_operation_id"), GraphCreator) && GraphCreator == OperationId
+				&& SpecGraph.IsValid() && SpecGraph->TryGetStringField(TEXT("kind"), SpecGraphKind)
+				&& SpecGraphKind == TEXT("created_function")
+				&& SpecGraph->TryGetStringField(TEXT("function_operation_id"), SpecGraphCreator) && SpecGraphCreator == OperationId
+				&& ContainsDependency(Dependencies, OperationId) && ContainsDependency(SpecDependencies, OperationId);
+			if (!bWholeFunctionPreflight) { WholeFunctionPreflightFailure = TEXT("BODY_ENVELOPE_MISMATCH"); break; }
+
+			if (BodyVersion == TEXT("graph.add-node@1.0") && BodyCapability == AddNodeCapability && SpecKindValue == TEXT("add_node"))
+			{
+				FString LogicalId, NodeClass, SemanticType, CreatedGuid, SpecLogicalId;
+				FGuid ParsedGuid;
+				const TSharedPtr<FJsonObject> Position = ObjectField(BodyPayload, TEXT("position"));
+				double X = 0, Y = 0;
+				bWholeFunctionPreflight = Position.IsValid()
+					&& BodyPayload->TryGetStringField(TEXT("logical_id"), LogicalId) && !LogicalId.IsEmpty()
+					&& BodySpecPayload->TryGetStringField(TEXT("logical_id"), SpecLogicalId) && SpecLogicalId == LogicalId
+					&& BodyPayload->TryGetStringField(TEXT("node_class"), NodeClass) && NodeClass == TEXT("K2Node_IfThenElse")
+					&& BodyPayload->TryGetStringField(TEXT("semantic_type"), SemanticType) && SemanticType == TEXT("branch")
+					&& BodyPayload->TryGetStringField(TEXT("created_node_guid"), CreatedGuid)
+					&& FGuid::Parse(CreatedGuid, ParsedGuid) && ParsedGuid.IsValid()
+					&& Position->TryGetNumberField(TEXT("x"), X) && Position->TryGetNumberField(TEXT("y"), Y)
+					&& !FuturePins.Contains(TEXT("logical:") + LogicalId);
+				if (bWholeFunctionPreflight)
+				{
+					TMap<FString, FString> Pins;
+					Pins.Add(PinKey(TEXT("input"), TEXT("execute")), TEXT("exec"));
+					Pins.Add(PinKey(TEXT("input"), TEXT("Condition")), TEXT("bool"));
+					Pins.Add(PinKey(TEXT("output"), TEXT("then")), TEXT("exec"));
+					Pins.Add(PinKey(TEXT("output"), TEXT("else")), TEXT("exec"));
+					FuturePins.Add(TEXT("logical:") + LogicalId, Pins); LogicalOperationIds.Add(LogicalId, BodyId);
+				}
+				else WholeFunctionPreflightFailure = TEXT("BRANCH_BODY_MISMATCH");
+			}
+			else if (BodyVersion == TEXT("graph.add-call-function-standard@1.0")
+				&& BodyCapability == CallFunctionCapability && SpecKindValue == TEXT("add_node"))
+			{
+				FString LogicalId, SpecLogicalId, CandidateId, AdmissionState, Owner, Member, RequestedOwner, RequestedMember;
+				const TSharedPtr<FJsonObject> Requested = ObjectField(BodySpecPayload, TEXT("function"));
+				const TArray<TSharedPtr<FJsonValue>>* ExpectedParameters = ArrayField(BodyPayload, TEXT("expected_parameters"));
+				const TSharedPtr<FJsonObject> Flags = ObjectField(BodyPayload, TEXT("function_flags"));
+				bool bPure = false;
+				if (Requested.IsValid()) { Requested->TryGetStringField(TEXT("owner"), RequestedOwner); Requested->TryGetStringField(TEXT("member"), RequestedMember); }
+				FString FunctionFailure;
+				UFunction* Function = ResolveExactCallFunction(BodyPayload, FunctionFailure);
+				bWholeFunctionPreflight = Function && ExpectedParameters && Flags.IsValid()
+					&& BodyPayload->TryGetStringField(TEXT("logical_id"), LogicalId) && !LogicalId.IsEmpty()
+					&& BodySpecPayload->TryGetStringField(TEXT("logical_id"), SpecLogicalId) && SpecLogicalId == LogicalId
+					&& BodyPayload->TryGetStringField(TEXT("candidate_id"), CandidateId) && ValidHash(CandidateId)
+					&& BodyPayload->TryGetStringField(TEXT("admission_state"), AdmissionState)
+					&& AdmissionState == TEXT("ADMITTED_FOR_CALLFUNCTION_V1")
+					&& BodyPayload->TryGetStringField(TEXT("authoritative_owner"), Owner) && Owner == RequestedOwner
+					&& BodyPayload->TryGetStringField(TEXT("native_member"), Member) && Member == RequestedMember
+					&& Flags->TryGetBoolField(TEXT("blueprint_pure"), bPure)
+					&& !FuturePins.Contains(TEXT("logical:") + LogicalId);
+				if (bWholeFunctionPreflight)
+				{
+					TMap<FString, FString> Pins;
+					for (const TSharedPtr<FJsonValue>& ParameterValue : *ExpectedParameters)
+					{
+						const TSharedPtr<FJsonObject> Parameter = ParameterValue->AsObject();
+						const TSharedPtr<FJsonObject> Type = ObjectField(Parameter, TEXT("pin_type"));
+						FString Name, Direction, Category;
+						if (!Parameter.IsValid() || !Type.IsValid() || !Parameter->TryGetStringField(TEXT("name"), Name)
+							|| !Parameter->TryGetStringField(TEXT("direction"), Direction)
+							|| !Type->TryGetStringField(TEXT("category"), Category)) { bWholeFunctionPreflight = false; break; }
+						Pins.Add(PinKey(Direction == TEXT("input") || Direction == TEXT("inout") ? TEXT("input") : TEXT("output"), Name), Category);
+					}
+					if (!bPure) { Pins.Add(PinKey(TEXT("input"), TEXT("execute")), TEXT("exec"));
+						Pins.Add(PinKey(TEXT("output"), TEXT("then")), TEXT("exec")); }
+					FuturePins.Add(TEXT("logical:") + LogicalId, Pins); LogicalOperationIds.Add(LogicalId, BodyId);
+					PlannedWholeCallFunctions.Add(BodyId, Function);
+				}
+				else WholeFunctionPreflightFailure = Function ? TEXT("CALLFUNCTION_BODY_MISMATCH") : FunctionFailure;
+			}
+			else if (BodyVersion == TEXT("graph.connect-pins@1.0")
+				&& BodyCapability == ConnectPinsCapability && SpecKindValue == TEXT("connect_pins"))
+			{
+				const TSharedPtr<FJsonObject> From = ObjectField(BodyPayload, TEXT("from"));
+				const TSharedPtr<FJsonObject> To = ObjectField(BodyPayload, TEXT("to"));
+				const TSharedPtr<FJsonObject> FromRef = ObjectField(From, TEXT("node_reference"));
+				const TSharedPtr<FJsonObject> ToRef = ObjectField(To, TEXT("node_reference"));
+				FString FromKey, ToKey, FromName, ToName, FromCategory, ToCategory, Classification;
+				bWholeFunctionPreflight = ReferenceKey(FromRef, FromKey) && ReferenceKey(ToRef, ToKey) && FromKey != ToKey
+					&& From.IsValid() && To.IsValid()
+					&& From->TryGetStringField(TEXT("pin_name"), FromName)
+					&& To->TryGetStringField(TEXT("pin_name"), ToName)
+					&& From->TryGetStringField(TEXT("category"), FromCategory)
+					&& To->TryGetStringField(TEXT("category"), ToCategory) && FromCategory == ToCategory
+					&& BodyPayload->TryGetStringField(TEXT("classification"), Classification)
+					&& Classification == (FromCategory == TEXT("exec") ? TEXT("execution") : TEXT("data"));
+				const FString FromPinKey = PinKey(TEXT("output"), FromName);
+				const FString ToPinKey = PinKey(TEXT("input"), ToName);
+				bWholeFunctionPreflight = bWholeFunctionPreflight && FuturePins.FindRef(FromKey).FindRef(FromPinKey) == FromCategory
+					&& FuturePins.FindRef(ToKey).FindRef(ToPinKey) == ToCategory
+					&& !ClaimedFuturePins.Contains(FromKey + TEXT(":") + FromPinKey)
+					&& !ClaimedFuturePins.Contains(ToKey + TEXT(":") + ToPinKey);
+				if (FromKey.StartsWith(TEXT("logical:")))
+				{
+					const FString Dependency = LogicalOperationIds.FindRef(FromKey.RightChop(8));
+					bWholeFunctionPreflight = bWholeFunctionPreflight && !Dependency.IsEmpty()
+						&& ContainsDependency(Dependencies, Dependency) && ContainsDependency(SpecDependencies, Dependency);
+				}
+				if (ToKey.StartsWith(TEXT("logical:")))
+				{
+					const FString Dependency = LogicalOperationIds.FindRef(ToKey.RightChop(8));
+					bWholeFunctionPreflight = bWholeFunctionPreflight && !Dependency.IsEmpty()
+						&& ContainsDependency(Dependencies, Dependency) && ContainsDependency(SpecDependencies, Dependency);
+				}
+				if (bWholeFunctionPreflight)
+				{
+					ClaimedFuturePins.Add(FromKey + TEXT(":") + FromPinKey);
+					ClaimedFuturePins.Add(ToKey + TEXT(":") + ToPinKey);
+				}
+				else WholeFunctionPreflightFailure = TEXT("CONNECTION_BODY_MISMATCH");
+			}
+			else { bWholeFunctionPreflight = false; WholeFunctionPreflightFailure = TEXT("UNSUPPORTED_BODY_OPERATION"); }
+		}
+		if (!bWholeFunctionPreflight)
+		{
+			SetFailure(Receipt, TEXT("LIVE_PREFLIGHT"), TEXT("FUTURE_FUNCTION_BODY_INVALID"), TEXT("FAILED_PRE_MUTATION"),
+				FString::Printf(TEXT("Future function body operations failed exact semantic preflight: %s"),
+					*WholeFunctionPreflightFailure));
 			return Complete(Receipt);
 		}
 
@@ -2093,6 +2315,156 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		Mutation->SetNumberField(TEXT("created_terminals"), bMutated ? (bHasOutputs ? 2 : 1) : 0);
 		Evidence->SetObjectField(TEXT("mutation"), Mutation);
 		if (!bMutated) return RollbackFunction(TEXT("MUTATION"), TEXT("FUNCTION_SHELL_CREATION_FAILED"), false);
+
+		TMap<FString, UEdGraphNode*> WholeLogicalNodes;
+		TArray<TPair<UEdGraphPin*, UEdGraphPin*>> WholeConnections;
+		auto CountFunctionLinks = [&]()
+		{
+			int32 DirectedLinks = 0;
+			for (UEdGraphNode* Node : NewGraph->Nodes) if (Node) for (UEdGraphPin* Pin : Node->Pins)
+				if (Pin) DirectedLinks += Pin->LinkedTo.Num();
+			return DirectedLinks / 2;
+		};
+		const int32 ShellConnectionCount = CountFunctionLinks();
+		auto ResolveWholeReference = [&](const TSharedPtr<FJsonObject>& Reference) -> UEdGraphNode*
+		{
+			FString Kind, Identity;
+			if (!Reference.IsValid() || !Reference->TryGetStringField(TEXT("kind"), Kind)) return nullptr;
+			if (Kind == TEXT("logical") && Reference->TryGetStringField(TEXT("logical_id"), Identity))
+				return WholeLogicalNodes.FindRef(Identity);
+			if (Kind == TEXT("function_entry") && Reference->TryGetStringField(TEXT("function_operation_id"), Identity)
+				&& Identity == OperationId) return Entry;
+			if (Kind == TEXT("function_return") && Reference->TryGetStringField(TEXT("function_operation_id"), Identity)
+				&& Identity == OperationId) return ResultNode;
+			return nullptr;
+		};
+		auto ResolveWholePin = [](UEdGraphNode* Node, const FString& Name, EEdGraphPinDirection Direction,
+			const FString& Category) -> UEdGraphPin*
+		{
+			UEdGraphPin* Match = nullptr;
+			if (!Node) return nullptr;
+			for (UEdGraphPin* Pin : Node->Pins)
+			{
+				if (!Pin || Pin->Direction != Direction || Pin->PinName.ToString() != Name
+					|| Pin->PinType.ContainerType != EPinContainerType::None
+					|| !Pin->PinType.PinCategory.ToString().Equals(Category, ESearchCase::IgnoreCase)) continue;
+				if (Match) return nullptr;
+				Match = Pin;
+			}
+			return Match;
+		};
+		bool bBodyMutated = true;
+		FString BodyFailureCode;
+		for (int32 Index = 1; Index < Operations->Num() && bBodyMutated; ++Index)
+		{
+			const TSharedPtr<FJsonObject> Body = (*Operations)[Index]->AsObject();
+			const TSharedPtr<FJsonObject> BodyPayload = ObjectField(Body, TEXT("semantic_payload"));
+			FString BodyId, Version;
+			Body->TryGetStringField(TEXT("operation_id"), BodyId);
+			Body->TryGetStringField(TEXT("operation_version"), Version);
+			if (Version == TEXT("graph.add-node@1.0"))
+			{
+				FString LogicalId, CreatedGuid;
+				double X = 0, Y = 0;
+				FGuid ParsedGuid;
+				const TSharedPtr<FJsonObject> Position = ObjectField(BodyPayload, TEXT("position"));
+				bBodyMutated = Position.IsValid() && BodyPayload->TryGetStringField(TEXT("logical_id"), LogicalId)
+					&& BodyPayload->TryGetStringField(TEXT("created_node_guid"), CreatedGuid)
+					&& FGuid::Parse(CreatedGuid, ParsedGuid) && ParsedGuid.IsValid()
+					&& Position->TryGetNumberField(TEXT("x"), X) && Position->TryGetNumberField(TEXT("y"), Y)
+					&& !WholeLogicalNodes.Contains(LogicalId);
+				if (bBodyMutated)
+				{
+					NewGraph->Modify(); Blueprint->Modify();
+					UK2Node_IfThenElse* Branch = NewObject<UK2Node_IfThenElse>(NewGraph);
+					Branch->NodeGuid = ParsedGuid; Branch->NodePosX = static_cast<int32>(X); Branch->NodePosY = static_cast<int32>(Y);
+					NewGraph->AddNode(Branch, false, false); Branch->AllocateDefaultPins();
+					bBodyMutated = Branch->Pins.Num() == 4;
+					if (bBodyMutated) WholeLogicalNodes.Add(LogicalId, Branch);
+				}
+				if (!bBodyMutated) BodyFailureCode = TEXT("ADD_NODE_FAILED");
+			}
+			else if (Version == TEXT("graph.add-call-function-standard@1.0"))
+			{
+				FString LogicalId, CreatedGuid;
+				double X = 0, Y = 0;
+				FGuid ParsedGuid;
+				bool bPure = false;
+				const TSharedPtr<FJsonObject> Position = ObjectField(BodyPayload, TEXT("position"));
+				const TSharedPtr<FJsonObject> Flags = ObjectField(BodyPayload, TEXT("function_flags"));
+				const TArray<TSharedPtr<FJsonValue>>* ExpectedParameters = ArrayField(BodyPayload, TEXT("expected_parameters"));
+				UFunction* Function = PlannedWholeCallFunctions.FindRef(BodyId);
+				bBodyMutated = Function && Position.IsValid() && Flags.IsValid() && ExpectedParameters
+					&& BodyPayload->TryGetStringField(TEXT("logical_id"), LogicalId)
+					&& BodyPayload->TryGetStringField(TEXT("created_node_guid"), CreatedGuid)
+					&& FGuid::Parse(CreatedGuid, ParsedGuid) && ParsedGuid.IsValid()
+					&& Position->TryGetNumberField(TEXT("x"), X) && Position->TryGetNumberField(TEXT("y"), Y)
+					&& Flags->TryGetBoolField(TEXT("blueprint_pure"), bPure)
+					&& !WholeLogicalNodes.Contains(LogicalId);
+				if (bBodyMutated)
+				{
+					NewGraph->Modify(); Blueprint->Modify();
+					UK2Node_CallFunction* Call = NewObject<UK2Node_CallFunction>(NewGraph);
+					Call->NodeGuid = ParsedGuid; Call->NodePosX = static_cast<int32>(X); Call->NodePosY = static_cast<int32>(Y);
+					Call->SetFromFunction(Function); NewGraph->AddNode(Call, false, false);
+					Call->AllocateDefaultPins(); Call->PostPlacedNewNode();
+					bBodyMutated = Call->GetTargetFunction() == Function
+						&& Call->Pins.Num() == ExpectedParameters->Num() + (bPure ? 0 : 2) + 1;
+					for (const TSharedPtr<FJsonValue>& ParameterValue : *ExpectedParameters)
+					{
+						const TSharedPtr<FJsonObject> Parameter = ParameterValue->AsObject();
+						const TSharedPtr<FJsonObject> Type = ObjectField(Parameter, TEXT("pin_type"));
+						FString Name, Direction, Category;
+						if (!Parameter.IsValid() || !Type.IsValid() || !Parameter->TryGetStringField(TEXT("name"), Name)
+							|| !Parameter->TryGetStringField(TEXT("direction"), Direction)
+							|| !Type->TryGetStringField(TEXT("category"), Category)
+							|| !ResolveWholePin(Call, Name, Direction == TEXT("input") || Direction == TEXT("inout") ? EGPD_Input : EGPD_Output,
+								Category)) bBodyMutated = false;
+					}
+					if (bBodyMutated) WholeLogicalNodes.Add(LogicalId, Call);
+				}
+				if (!bBodyMutated) BodyFailureCode = TEXT("ADD_CALL_FUNCTION_FAILED");
+			}
+			else if (Version == TEXT("graph.connect-pins@1.0"))
+			{
+				const TSharedPtr<FJsonObject> From = ObjectField(BodyPayload, TEXT("from"));
+				const TSharedPtr<FJsonObject> To = ObjectField(BodyPayload, TEXT("to"));
+				const TSharedPtr<FJsonObject> FromRef = ObjectField(From, TEXT("node_reference"));
+				const TSharedPtr<FJsonObject> ToRef = ObjectField(To, TEXT("node_reference"));
+				FString FromName, ToName, FromCategory, ToCategory;
+				UEdGraphNode* FromNode = ResolveWholeReference(FromRef);
+				UEdGraphNode* ToNode = ResolveWholeReference(ToRef);
+				UEdGraphPin* FromPin = From.IsValid() && From->TryGetStringField(TEXT("pin_name"), FromName)
+					&& From->TryGetStringField(TEXT("category"), FromCategory)
+					? ResolveWholePin(FromNode, FromName, EGPD_Output, FromCategory) : nullptr;
+				UEdGraphPin* ToPin = To.IsValid() && To->TryGetStringField(TEXT("pin_name"), ToName)
+					&& To->TryGetStringField(TEXT("category"), ToCategory)
+					? ResolveWholePin(ToNode, ToName, EGPD_Input, ToCategory) : nullptr;
+				const FPinConnectionResponse Response = FromPin && ToPin
+					? CastChecked<UEdGraphSchema_K2>(NewGraph->GetSchema())->CanCreateConnection(FromPin, ToPin)
+					: FPinConnectionResponse(CONNECT_RESPONSE_DISALLOW, FText::GetEmpty());
+				bBodyMutated = FromPin && ToPin && FromNode != ToNode && FromCategory == ToCategory
+					&& FromPin->LinkedTo.IsEmpty() && ToPin->LinkedTo.IsEmpty()
+					&& Response.Response == CONNECT_RESPONSE_MAKE
+					&& CastChecked<UEdGraphSchema_K2>(NewGraph->GetSchema())->TryCreateConnection(FromPin, ToPin)
+					&& FromPin->LinkedTo.Contains(ToPin) && ToPin->LinkedTo.Contains(FromPin);
+				if (bBodyMutated) WholeConnections.Add(TPair<UEdGraphPin*, UEdGraphPin*>(FromPin, ToPin));
+				else BodyFailureCode = TEXT("CONNECT_PINS_FAILED");
+			}
+			else { bBodyMutated = false; BodyFailureCode = TEXT("UNSUPPORTED_WHOLE_FUNCTION_OPERATION"); }
+			const int32 Middle = Operations->Num() / 2;
+			if (bBodyMutated && ((FaultCheckpoint == TEXT("AFTER_FIRST_MUTATION") && Index == 1)
+				|| (FaultCheckpoint == TEXT("AFTER_MIDDLE_MUTATION") && Index == Middle)
+				|| (FaultCheckpoint == TEXT("AFTER_FINAL_MUTATION") && Index == Operations->Num() - 1)))
+			{
+				bBodyMutated = false; BodyFailureCode = TEXT("FORCED_FAILURE_AFTER_BODY_MUTATION");
+			}
+		}
+		Mutation->SetNumberField(TEXT("created_body_nodes"), WholeLogicalNodes.Num());
+		Mutation->SetNumberField(TEXT("created_body_connections"), WholeConnections.Num());
+		Mutation->SetNumberField(TEXT("operation_count"), Operations->Num());
+		Mutation->SetBoolField(TEXT("succeeded"), bBodyMutated);
+		if (!bBodyMutated) return RollbackFunction(TEXT("MUTATION"), BodyFailureCode, false);
 		if (FaultCheckpoint == TEXT("AFTER_MUTATION") || FaultCheckpoint == TEXT("ROLLBACK_FAILURE")
 			|| FaultCheckpoint == TEXT("AFTER_ROLLBACK_BEFORE_FINAL_RECEIPT"))
 			return RollbackFunction(TEXT("MUTATION"), TEXT("FORCED_FAILURE_AFTER_MUTATION"), false);
@@ -2105,15 +2477,35 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		if (FaultCheckpoint == TEXT("AFTER_COMPILE_BEFORE_VERIFY"))
 			return RollbackFunction(TEXT("VERIFY"), TEXT("FORCED_AFTER_COMPILE_BEFORE_VERIFY"), false);
 		const bool bForcedVerifyFailure = FaultCheckpoint == TEXT("VERIFICATION_FAILURE");
+		bool bBodyNodesExact = WholeLogicalNodes.Num() == PlannedWholeCallFunctions.Num()
+			+ (Operations->Num() - 1 - PlannedWholeCallFunctions.Num() - WholeConnections.Num());
+		for (const auto& Pair : WholeLogicalNodes)
+		{
+			if (!Pair.Value || Pair.Value->GetGraph() != NewGraph || !Pair.Value->NodeGuid.IsValid()) bBodyNodesExact = false;
+			if (UK2Node_CallFunction* Call = Cast<UK2Node_CallFunction>(Pair.Value))
+			{
+				const FString* BodyOperationId = LogicalOperationIds.Find(Pair.Key);
+				if (!BodyOperationId || Call->GetTargetFunction() != PlannedWholeCallFunctions.FindRef(*BodyOperationId)) bBodyNodesExact = false;
+			}
+			else if (!Cast<UK2Node_IfThenElse>(Pair.Value)) bBodyNodesExact = false;
+		}
+		bool bBodyConnectionsExact = CountFunctionLinks() == ShellConnectionCount + WholeConnections.Num();
+		for (const TPair<UEdGraphPin*, UEdGraphPin*>& Pair : WholeConnections)
+			if (!Pair.Key || !Pair.Value || !Pair.Key->LinkedTo.Contains(Pair.Value) || !Pair.Value->LinkedTo.Contains(Pair.Key))
+				bBodyConnectionsExact = false;
 		const bool bVerified = !bForcedVerifyFailure && ExactFunctionGraph(Blueprint, FunctionName) == NewGraph
-			&& ExactFunctionShell(NewGraph, Inputs, Outputs) && ExactAssetInventory(Blueprint, BaselineInventory, FunctionName);
+			&& ExactFunctionShell(NewGraph, Inputs, Outputs, WholeLogicalNodes.Num())
+			&& bBodyNodesExact && bBodyConnectionsExact && ExactAssetInventory(Blueprint, BaselineInventory, FunctionName);
 		TSharedPtr<FJsonObject> Verification = Attempt(true, bVerified);
-		Verification->SetBoolField(TEXT("exact_function_shell"), bVerified);
-		Verification->SetBoolField(TEXT("original_graphs_unchanged"), bVerified);
+		Verification->SetBoolField(TEXT("exact_function_shell"), ExactFunctionShell(NewGraph, Inputs, Outputs, WholeLogicalNodes.Num()));
+		Verification->SetBoolField(TEXT("exact_body_nodes"), bBodyNodesExact);
+		Verification->SetBoolField(TEXT("exact_connection_set"), bBodyConnectionsExact);
+		Verification->SetBoolField(TEXT("original_graphs_unchanged"), ExactAssetInventory(Blueprint, BaselineInventory, FunctionName));
 		Verification->SetStringField(TEXT("function_graph_guid"), NewGraph->GraphGuid.ToString(EGuidFormats::Digits));
 		Evidence->SetObjectField(TEXT("verification"), Verification);
 		const FString PostFingerprint = Sha256(FunctionName + TEXT("|") + Signature + TEXT("|")
-			+ NewGraph->GraphGuid.ToString(EGuidFormats::Digits));
+			+ NewGraph->GraphGuid.ToString(EGuidFormats::Digits) + TEXT("|")
+			+ FString::FromInt(WholeLogicalNodes.Num()) + TEXT("|") + FString::FromInt(CountFunctionLinks()));
 		Evidence->SetStringField(TEXT("post_semantic_fingerprint"), PostFingerprint);
 		if (!bVerified) return RollbackFunction(TEXT("VERIFY"), TEXT("EXACT_FUNCTION_SHELL_FAILED"), false);
 		if (FaultCheckpoint == TEXT("AFTER_VERIFY_BEFORE_SAVE"))
@@ -2124,7 +2516,8 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		SaveEvidence->SetBoolField(TEXT("succeeded"), bSaved);
 		if (!bSaved) return RollbackFunction(TEXT("SAVE"), TEXT("BLUEPRINT_SAVE_FAILED"), FaultCheckpoint != TEXT("SAVE_FAILURE"));
 		const bool bPersisted = !Package->IsDirty() && ExactFunctionGraph(Blueprint, FunctionName) == NewGraph
-			&& ExactFunctionShell(NewGraph, Inputs, Outputs) && ExactAssetInventory(Blueprint, BaselineInventory, FunctionName);
+			&& ExactFunctionShell(NewGraph, Inputs, Outputs, WholeLogicalNodes.Num())
+			&& bBodyNodesExact && bBodyConnectionsExact && ExactAssetInventory(Blueprint, BaselineInventory, FunctionName);
 		SaveEvidence->SetBoolField(TEXT("persisted_verified"), bPersisted);
 		SaveEvidence->SetBoolField(TEXT("package_clean"), !Package->IsDirty());
 		DirtyState->SetBoolField(TEXT("final"), Package->IsDirty());
@@ -4681,3 +5074,4 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::QualifyCallFunctionCandidates(const T
 	Output->SetBoolField(TEXT("save_performed"), false);
 	return MCPResult(Output);
 }
+UE_ENABLE_OPTIMIZATION
