@@ -17,6 +17,7 @@
 #include "Kismet2/CompilerResultsLog.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
+#include "Kismet2/Kismet2NameValidators.h"
 #include "K2Node_IfThenElse.h"
 #include "K2Node_CallFunction.h"
 #include "K2Node_Variable.h"
@@ -26,6 +27,8 @@
 #include "K2Node_BreakStruct.h"
 #include "K2Node_SetFieldsInStruct.h"
 #include "K2Node_StructOperation.h"
+#include "K2Node_FunctionEntry.h"
+#include "K2Node_FunctionResult.h"
 #include "Misc/EngineVersion.h"
 #include "Misc/App.h"
 #include "Misc/FileHelper.h"
@@ -52,6 +55,7 @@ namespace
 	const TCHAR* MakeStructCapability = TEXT("graph.add-make-struct");
 	const TCHAR* BreakStructCapability = TEXT("graph.add-break-struct");
 	const TCHAR* SetMembersInStructCapability = TEXT("graph.add-set-members-in-struct");
+	const TCHAR* FunctionAddCapability = TEXT("function.add");
 	const TCHAR* CapabilityVersion = TEXT("1.0");
 	const TCHAR* OperationVersion = TEXT("graph.set-pin-default@1.0");
 	const TCHAR* HandlerVersion = TEXT("spacehead.graph.set-pin-default-handler@1.0");
@@ -1348,6 +1352,138 @@ namespace
 		return nullptr;
 	}
 
+	bool FunctionParameterPinType(const FString& SemanticType, FEdGraphPinType& OutType)
+	{
+		OutType = FEdGraphPinType();
+		if (SemanticType == TEXT("bool")) OutType.PinCategory = UEdGraphSchema_K2::PC_Boolean;
+		else if (SemanticType == TEXT("int")) OutType.PinCategory = UEdGraphSchema_K2::PC_Int;
+		else if (SemanticType == TEXT("float"))
+		{
+			OutType.PinCategory = UEdGraphSchema_K2::PC_Real;
+			OutType.PinSubCategory = UEdGraphSchema_K2::PC_Float;
+		}
+		else if (SemanticType == TEXT("name")) OutType.PinCategory = UEdGraphSchema_K2::PC_Name;
+		else if (SemanticType == TEXT("string")) OutType.PinCategory = UEdGraphSchema_K2::PC_String;
+		else return false;
+		return true;
+	}
+
+	bool ExactFunctionParameterArrays(const TArray<TSharedPtr<FJsonValue>>* SpecParameters,
+		const TArray<TSharedPtr<FJsonValue>>* PlannedParameters, const TCHAR* Role,
+		const TCHAR* Terminal, const TCHAR* PinDirection)
+	{
+		if (!SpecParameters || !PlannedParameters || SpecParameters->Num() != PlannedParameters->Num()
+			|| SpecParameters->Num() > 16) return false;
+		TSet<FString> Names;
+		for (int32 Index = 0; Index < SpecParameters->Num(); ++Index)
+		{
+			const TSharedPtr<FJsonObject> Spec = (*SpecParameters)[Index]->AsObject();
+			const TSharedPtr<FJsonObject> Planned = (*PlannedParameters)[Index]->AsObject();
+			FString SpecName, SpecType, PlannedName, PlannedType, PlannedRole, PlannedTerminal, PlannedDirection;
+			double Ordinal = -1;
+			FEdGraphPinType IgnoredType;
+			if (!Spec.IsValid() || !Planned.IsValid()
+				|| !Spec->TryGetStringField(TEXT("name"), SpecName) || SpecName.IsEmpty()
+				|| !Spec->TryGetStringField(TEXT("type"), SpecType) || !FunctionParameterPinType(SpecType, IgnoredType)
+				|| !Planned->TryGetStringField(TEXT("name"), PlannedName) || PlannedName != SpecName
+				|| !Planned->TryGetStringField(TEXT("type"), PlannedType) || PlannedType != SpecType
+				|| !Planned->TryGetStringField(TEXT("semantic_role"), PlannedRole) || PlannedRole != Role
+				|| !Planned->TryGetStringField(TEXT("terminal"), PlannedTerminal) || PlannedTerminal != Terminal
+				|| !Planned->TryGetStringField(TEXT("unreal_pin_direction"), PlannedDirection) || PlannedDirection != PinDirection
+				|| !Planned->TryGetNumberField(TEXT("ordinal"), Ordinal) || Ordinal != Index
+				|| Names.Contains(SpecName.ToLower())) return false;
+			Names.Add(SpecName.ToLower());
+		}
+		return true;
+	}
+
+	UEdGraph* ExactFunctionGraph(UBlueprint* Blueprint, const FString& FunctionName)
+	{
+		if (!Blueprint) return nullptr;
+		UEdGraph* Match = nullptr;
+		for (UEdGraph* Graph : Blueprint->FunctionGraphs)
+		{
+			if (!Graph || Graph->GetName() != FunctionName) continue;
+			if (Match) return nullptr;
+			Match = Graph;
+		}
+		return Match;
+	}
+
+	bool ExactAssetInventory(UBlueprint* Blueprint, const TArray<TSharedPtr<FJsonValue>>* BaselineInventory,
+		const FString& ExcludedNewFunction = FString())
+	{
+		if (!Blueprint || !BaselineInventory) return false;
+		TArray<UEdGraph*> Graphs;
+		Blueprint->GetAllGraphs(Graphs);
+		Graphs.RemoveAll([&](const UEdGraph* Graph) { return Graph && !ExcludedNewFunction.IsEmpty()
+			&& Graph->GetName() == ExcludedNewFunction; });
+		if (Graphs.Num() != BaselineInventory->Num()) return false;
+		TSet<UEdGraph*> Matched;
+		for (const TSharedPtr<FJsonValue>& Value : *BaselineInventory)
+		{
+			const TSharedPtr<FJsonObject> Expected = Value->AsObject();
+			FString Name, Guid;
+			double NodeCount = -1;
+			if (!Expected.IsValid() || !Expected->TryGetStringField(TEXT("graph_name"), Name)
+				|| !Expected->TryGetNumberField(TEXT("node_count"), NodeCount)) return false;
+			Expected->TryGetStringField(TEXT("graph_guid"), Guid);
+			UEdGraph* Found = nullptr;
+			for (UEdGraph* Graph : Graphs)
+			{
+				if (!Graph || Matched.Contains(Graph) || Graph->GetName() != Name
+					|| Graph->Nodes.Num() != static_cast<int32>(NodeCount)) continue;
+				if (!Guid.IsEmpty() && NormalizeGuid(Graph->GraphGuid.ToString(EGuidFormats::Digits)) != NormalizeGuid(Guid)) continue;
+				if (Found) return false;
+				Found = Graph;
+			}
+			if (!Found) return false;
+			Matched.Add(Found);
+		}
+		return Matched.Num() == Graphs.Num();
+	}
+
+	bool ExactFunctionShell(UEdGraph* Graph, const TArray<TSharedPtr<FJsonValue>>* Inputs,
+		const TArray<TSharedPtr<FJsonValue>>* Outputs)
+	{
+		if (!Graph || !Inputs || !Outputs) return false;
+		TArray<UK2Node_FunctionEntry*> Entries;
+		TArray<UK2Node_FunctionResult*> Results;
+		Graph->GetNodesOfClass(Entries);
+		Graph->GetNodesOfClass(Results);
+		if (Entries.Num() != 1 || Results.Num() != (Outputs->Num() > 0 ? 1 : 0)
+			|| Graph->Nodes.Num() != Entries.Num() + Results.Num()) return false;
+		auto ExactPins = [](const UK2Node_EditablePinBase* Node, const TArray<TSharedPtr<FJsonValue>>& Expected,
+			EEdGraphPinDirection Direction)
+		{
+			if (!Node) return false;
+			TArray<const UEdGraphPin*> DataPins;
+			for (const UEdGraphPin* Pin : Node->Pins)
+				if (Pin && Pin->Direction == Direction && Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+					DataPins.Add(Pin);
+			if (DataPins.Num() != Expected.Num()) return false;
+			for (int32 Index = 0; Index < Expected.Num(); ++Index)
+			{
+				const TSharedPtr<FJsonObject> Parameter = Expected[Index]->AsObject();
+				FString Name, Type;
+				FEdGraphPinType ExpectedType;
+				if (!Parameter.IsValid() || !Parameter->TryGetStringField(TEXT("name"), Name)
+					|| !Parameter->TryGetStringField(TEXT("type"), Type) || !FunctionParameterPinType(Type, ExpectedType)
+					|| DataPins[Index]->PinName.ToString() != Name
+					|| DataPins[Index]->PinType.PinCategory != ExpectedType.PinCategory
+					|| DataPins[Index]->PinType.PinSubCategory != ExpectedType.PinSubCategory
+					|| DataPins[Index]->PinType.ContainerType != EPinContainerType::None
+					|| DataPins[Index]->PinType.bIsReference || DataPins[Index]->PinType.bIsWeakPointer
+					|| DataPins[Index]->PinType.bIsUObjectWrapper) return false;
+			}
+			return true;
+		};
+		return Entries[0]->NodePosX == 0 && Entries[0]->NodePosY == 0
+			&& (!Results.Num() || (Results[0]->NodePosX == 800 && Results[0]->NodePosY == 0))
+			&& ExactPins(Entries[0], *Inputs, EGPD_Output)
+			&& (!Results.Num() || ExactPins(Results[0], *Outputs, EGPD_Input));
+	}
+
 	bool CompileWithoutSave(UBlueprint* Blueprint, TSharedPtr<FJsonObject>& Evidence)
 	{
 		FCompilerResultsLog Log;
@@ -1590,6 +1726,7 @@ namespace
 			CapabilityJson(MakeStructCapability),
 			CapabilityJson(BreakStructCapability),
 			CapabilityJson(SetMembersInStructCapability),
+			CapabilityJson(FunctionAddCapability),
 		});
 		return Result;
 	}
@@ -1754,6 +1891,259 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 	FString FirstOperationVersion;
 	if (Operations && Operations->Num() == 1 && (*Operations)[0]->AsObject().IsValid())
 		(*Operations)[0]->AsObject()->TryGetStringField(TEXT("operation_version"), FirstOperationVersion);
+	if (FirstOperationVersion == TEXT("function.add@1.0"))
+	{
+		const TSharedPtr<FJsonObject> Operation = (*Operations)[0]->AsObject();
+		const TSharedPtr<FJsonObject> Payload = ObjectField(Operation, TEXT("semantic_payload"));
+		const TSharedPtr<FJsonObject> SpecTarget = ObjectField(BuildSpec, TEXT("target"));
+		const TArray<TSharedPtr<FJsonValue>>* SpecOperations = ArrayField(BuildSpec, TEXT("operations"));
+		const TSharedPtr<FJsonObject> SpecOperation = SpecOperations && SpecOperations->Num() == 1 ? (*SpecOperations)[0]->AsObject() : nullptr;
+		const TSharedPtr<FJsonObject> SpecPayload = ObjectField(SpecOperation, TEXT("payload"));
+		const TSharedPtr<FJsonObject> SpecPolicy = ObjectField(BuildSpec, TEXT("policy"));
+		const TArray<TSharedPtr<FJsonValue>>* BaselineInventory = ArrayField(Payload, TEXT("baseline_graph_inventory"));
+		const TArray<TSharedPtr<FJsonValue>>* Inputs = ArrayField(Payload, TEXT("inputs"));
+		const TArray<TSharedPtr<FJsonValue>>* Outputs = ArrayField(Payload, TEXT("outputs"));
+		const TArray<TSharedPtr<FJsonValue>>* SpecInputs = ArrayField(SpecPayload, TEXT("inputs"));
+		const TArray<TSharedPtr<FJsonValue>>* SpecOutputs = ArrayField(SpecPayload, TEXT("outputs"));
+		const TSharedPtr<FJsonObject> EntryExpectation = ObjectField(Payload, TEXT("entry"));
+		const TSharedPtr<FJsonObject> ResultExpectation = ObjectField(Payload, TEXT("result"));
+		FString PackagePath, BlueprintName, Capability, OperationId, FunctionName, SpecFunctionName;
+		FString SpecVersion, SpecRequestId, SpecFamily, SpecKind, SpecOperationVersion, Atomicity;
+		FString InventoryFingerprint, Signature, EntryClass, ResultClass;
+		double EntryX = -1, EntryY = -1, ResultX = -1, ResultY = -1;
+		bool bCompileWithoutSave = false, bSaveAfterVerification = false, bRollbackOnFailure = false;
+		const bool bHasOutputs = Outputs && Outputs->Num() > 0;
+		if (!Target.IsValid() || !SpecTarget.IsValid() || !Selectors || Selectors->Num() != 0
+			|| !Operation.IsValid() || !Payload.IsValid() || !SpecOperation.IsValid() || !SpecPayload.IsValid() || !SpecPolicy.IsValid()
+			|| CanonicalJsonObject(SpecTarget) != CanonicalJsonObject(Target)
+			|| !Target->TryGetStringField(TEXT("package_path"), PackagePath)
+			|| !Target->TryGetStringField(TEXT("blueprint_name"), BlueprintName)
+			|| !PackagePath.StartsWith(TEXT("/Game/Tests/Builder/")) || PackagePath != TEXT("/Game/Tests/Builder/") + BlueprintName
+			|| !Operation->TryGetStringField(TEXT("semantic_capability_id"), Capability) || Capability != FunctionAddCapability
+			|| !Operation->TryGetStringField(TEXT("operation_id"), OperationId) || OperationId.IsEmpty()
+			|| !Payload->TryGetStringField(TEXT("function_name"), FunctionName) || FunctionName.IsEmpty()
+			|| !Payload->TryGetStringField(TEXT("baseline_inventory_fingerprint"), InventoryFingerprint) || !ValidHash(InventoryFingerprint)
+			|| !Payload->TryGetStringField(TEXT("deterministic_signature"), Signature) || !ValidHash(Signature)
+			|| !BaselineInventory || Sha256(CanonicalJsonValue(MakeShared<FJsonValueArray>(*BaselineInventory))) != InventoryFingerprint
+			|| !Inputs || !Outputs || !EntryExpectation.IsValid()
+			|| !EntryExpectation->TryGetStringField(TEXT("node_class"), EntryClass) || EntryClass != TEXT("K2Node_FunctionEntry")
+			|| !EntryExpectation->TryGetNumberField(TEXT("x"), EntryX) || EntryX != 0
+			|| !EntryExpectation->TryGetNumberField(TEXT("y"), EntryY) || EntryY != 0
+			|| (bHasOutputs && (!ResultExpectation.IsValid()
+				|| !ResultExpectation->TryGetStringField(TEXT("node_class"), ResultClass) || ResultClass != TEXT("K2Node_FunctionResult")
+				|| !ResultExpectation->TryGetNumberField(TEXT("x"), ResultX) || ResultX != 800
+				|| !ResultExpectation->TryGetNumberField(TEXT("y"), ResultY) || ResultY != 0))
+			|| (!bHasOutputs && ResultExpectation.IsValid())
+			|| !BuildSpec->TryGetStringField(TEXT("spec_version"), SpecVersion) || SpecVersion != TEXT("spacehead.blueprint-build-spec@1.0")
+			|| !BuildSpec->TryGetStringField(TEXT("request_id"), SpecRequestId) || SpecRequestId.IsEmpty()
+			|| !SpecOperation->TryGetStringField(TEXT("family"), SpecFamily) || SpecFamily != TEXT("function")
+			|| !SpecOperation->TryGetStringField(TEXT("kind"), SpecKind) || SpecKind != TEXT("add_function")
+			|| !SpecOperation->TryGetStringField(TEXT("operation_version"), SpecOperationVersion) || SpecOperationVersion != TEXT("function.add@1.0")
+			|| !SpecPayload->TryGetStringField(TEXT("function_name"), SpecFunctionName) || SpecFunctionName != FunctionName
+			|| !ExactFunctionParameterArrays(SpecInputs, Inputs, TEXT("INPUT"), TEXT("FunctionEntry"), TEXT("output"))
+			|| !ExactFunctionParameterArrays(SpecOutputs, Outputs, TEXT("OUTPUT"), TEXT("FunctionResult"), TEXT("input"))
+			|| !SpecPolicy->TryGetStringField(TEXT("atomicity"), Atomicity) || Atomicity != TEXT("ONE_BLUEPRINT_PACKAGE")
+			|| !SpecPolicy->TryGetBoolField(TEXT("compile_without_save"), bCompileWithoutSave) || !bCompileWithoutSave
+			|| !SpecPolicy->TryGetBoolField(TEXT("save_after_verification_only"), bSaveAfterVerification) || !bSaveAfterVerification
+			|| !SpecPolicy->TryGetBoolField(TEXT("rollback_on_failure"), bRollbackOnFailure) || !bRollbackOnFailure)
+		{
+			SetFailure(Receipt, TEXT("SPEC"), TEXT("BUILD_SPEC_PLAN_MISMATCH"), TEXT("FAILED_PRE_MUTATION"),
+				TEXT("Function BuildSpec and deterministic function-shell BuildPlan do not match"));
+			return Complete(Receipt);
+		}
+
+		FString TargetIdentity, FencingToken, LockOwner;
+		double FencingSequenceNumber = 0;
+		const FString ExpectedTargetIdentity = PackagePath + TEXT(":") + BlueprintName;
+		if (!Fencing->TryGetStringField(TEXT("target_identity"), TargetIdentity) || TargetIdentity != ExpectedTargetIdentity
+			|| !Fencing->TryGetStringField(TEXT("fencing_token"), FencingToken)
+			|| !Fencing->TryGetStringField(TEXT("lock_owner_request_id"), LockOwner) || LockOwner != SpecRequestId
+			|| !Fencing->TryGetNumberField(TEXT("fencing_sequence"), FencingSequenceNumber)
+			|| FencingSequenceNumber < 1 || FMath::FloorToDouble(FencingSequenceNumber) != FencingSequenceNumber
+			|| !AcceptFencing(TargetIdentity, TransactionId, FencingToken, static_cast<int64>(FencingSequenceNumber)))
+		{
+			SetFailure(Receipt, TEXT("CONCURRENCY"), TEXT("STALE_OR_INVALID_FENCING"), TEXT("FAILED_PRE_MUTATION"),
+				TEXT("Bridge fencing validation failed closed"));
+			return Complete(Receipt);
+		}
+		FString FaultCheckpoint;
+		if (!ReadTestFaultCheckpoint(TestHooks, PackagePath, FaultCheckpoint))
+		{
+			SetFailure(Receipt, TEXT("SPEC"), TEXT("TEST_HOOKS_NOT_AUTHORIZED"), TEXT("FAILED_PRE_MUTATION"),
+				TEXT("Fault injection requires the disposable ue_mcp test-project gate"));
+			return Complete(Receipt);
+		}
+		TSharedPtr<FJsonObject> Evidence = ObjectField(Receipt, TEXT("evidence"));
+		Evidence->SetNumberField(TEXT("dispatch_count"), 1);
+		if (!FaultCheckpoint.IsEmpty()) Evidence->SetStringField(TEXT("fault_checkpoint"), FaultCheckpoint);
+		TSharedPtr<FJsonObject> Received = CloneObject(Receipt);
+		Received->SetStringField(TEXT("state"), TEXT("UNKNOWN"));
+		SetFailure(Received, TEXT("TRANSPORT_UNKNOWN"), TEXT("EXECUTION_IN_PROGRESS_OR_INTERRUPTED"), TEXT("UNKNOWN"),
+			TEXT("The bridge durably received the function transaction but no terminal outcome is yet recorded"));
+		if (!PersistDurableExecution(TransactionId, CorrelationId, PlanHash, Fencing, Received))
+		{
+			SetFailure(Receipt, TEXT("INTERNAL_CONTRACT"), TEXT("DURABLE_RECEIPT_NOT_ESTABLISHED"), TEXT("QUARANTINED"),
+				TEXT("Function mutation was denied because durable correlated evidence could not be established"));
+			return Complete(Receipt);
+		}
+		if (FaultCheckpoint == TEXT("BEFORE_PREFLIGHT"))
+		{
+			Evidence->SetObjectField(TEXT("preflight"), Attempt(false, false));
+			SetFailure(Receipt, TEXT("LIVE_PREFLIGHT"), TEXT("FORCED_BEFORE_PREFLIGHT"), TEXT("FAILED_PRE_MUTATION"),
+				TEXT("Test-only failure injected before function live preflight"));
+			return Complete(Receipt);
+		}
+
+		UBlueprint* Blueprint = LoadBlueprint(PackagePath);
+		UPackage* Package = Blueprint ? Blueprint->GetOutermost() : nullptr;
+		const bool bDirtyBefore = Package && Package->IsDirty();
+		const bool bNameAccepted = Blueprint && FKismetNameValidator(Blueprint).IsValid(FunctionName) == EValidatorResult::Ok
+			&& FBlueprintEditorUtils::IsGraphNameUnique(Blueprint, FName(*FunctionName));
+		const bool bPreflight = Blueprint && Package && !bDirtyBefore && bNameAccepted
+			&& !ExactFunctionGraph(Blueprint, FunctionName) && ExactAssetInventory(Blueprint, BaselineInventory);
+		TSharedPtr<FJsonObject> DirtyState = MakeShared<FJsonObject>();
+		DirtyState->SetBoolField(TEXT("before"), bDirtyBefore);
+		DirtyState->SetBoolField(TEXT("after_preflight"), Package && Package->IsDirty());
+		Evidence->SetObjectField(TEXT("dirty_state"), DirtyState);
+		TSharedPtr<FJsonObject> Preflight = Attempt(true, bPreflight);
+		Preflight->SetBoolField(TEXT("asset_inventory_exact"), Blueprint && ExactAssetInventory(Blueprint, BaselineInventory));
+		Preflight->SetBoolField(TEXT("function_name_absent"), Blueprint && !ExactFunctionGraph(Blueprint, FunctionName));
+		Preflight->SetBoolField(TEXT("function_name_accepted"), bNameAccepted);
+		Preflight->SetStringField(TEXT("handler_version"), TEXT("spacehead.function.add-handler@1.0"));
+		Evidence->SetObjectField(TEXT("preflight"), Preflight);
+		Evidence->SetStringField(TEXT("pre_semantic_fingerprint"), InventoryFingerprint);
+		if (!bPreflight)
+		{
+			SetFailure(Receipt, TEXT("LIVE_PREFLIGHT"), bNameAccepted ? TEXT("STALE_ASSET_INVENTORY") : TEXT("FUNCTION_NAME_REJECTED"),
+				TEXT("FAILED_PRE_MUTATION"), TEXT("Live Blueprint asset preflight rejected the function shell"));
+			return Complete(Receipt);
+		}
+		if (FaultCheckpoint == TEXT("AFTER_PREFLIGHT_BEFORE_MUTATION"))
+		{
+			SetFailure(Receipt, TEXT("LIVE_PREFLIGHT"), TEXT("FORCED_AFTER_PREFLIGHT"), TEXT("FAILED_PRE_MUTATION"),
+				TEXT("Test-only failure injected after function preflight"));
+			return Complete(Receipt);
+		}
+
+		UEdGraph* NewGraph = nullptr;
+		auto RollbackFunction = [&](const TCHAR* Phase, const FString& Code, bool bPersistedStateUncertain) -> TSharedPtr<FJsonValue>
+		{
+			const bool bForcedRollbackFailure = FaultCheckpoint == TEXT("ROLLBACK_FAILURE");
+			if (NewGraph && !bForcedRollbackFailure)
+				FBlueprintEditorUtils::RemoveGraph(Blueprint, NewGraph, EGraphRemoveFlags::MarkTransient);
+			TSharedPtr<FJsonObject> RollbackCompile;
+			const bool bCompiled = !bForcedRollbackFailure && CompileWithoutSave(Blueprint, RollbackCompile);
+			const bool bSemanticRestored = bCompiled && !ExactFunctionGraph(Blueprint, FunctionName)
+				&& ExactAssetInventory(Blueprint, BaselineInventory);
+			if (bSemanticRestored && !bPersistedStateUncertain) Package->SetDirtyFlag(false);
+			const bool bRestored = bSemanticRestored && !Package->IsDirty() && !bPersistedStateUncertain;
+			TSharedPtr<FJsonObject> Rollback = Attempt(true, bRestored);
+			Rollback->SetBoolField(TEXT("function_removed"), !ExactFunctionGraph(Blueprint, FunctionName));
+			Rollback->SetBoolField(TEXT("semantic_restoration_verified"), bSemanticRestored);
+			Rollback->SetBoolField(TEXT("clean_state_restored"), !Package->IsDirty());
+			Rollback->SetBoolField(TEXT("persisted_state_uncertain"), bPersistedStateUncertain);
+			Rollback->SetObjectField(TEXT("compile"), RollbackCompile.IsValid() ? RollbackCompile : Attempt(false, false));
+			Evidence->SetObjectField(TEXT("rollback"), Rollback);
+			DirtyState->SetBoolField(TEXT("final"), Package->IsDirty());
+			SetFailure(Receipt, bRestored ? Phase : TEXT("ROLLBACK"), bRestored ? Code : TEXT("RESTORATION_UNPROVEN"),
+				bRestored ? TEXT("RESTORED") : TEXT("QUARANTINED"), bRestored
+					? TEXT("Function mutation failed and the exact Blueprint asset baseline was restored")
+					: TEXT("Function mutation failed and exact asset restoration could not be proven"));
+			return Complete(Receipt, FaultCheckpoint == TEXT("AFTER_ROLLBACK_BEFORE_FINAL_RECEIPT"));
+		};
+
+		Blueprint->Modify();
+		NewGraph = FBlueprintEditorUtils::CreateNewGraph(Blueprint, FName(*FunctionName), UEdGraph::StaticClass(), UEdGraphSchema_K2::StaticClass());
+		if (NewGraph) FBlueprintEditorUtils::AddFunctionGraph<UFunction>(Blueprint, NewGraph, true, nullptr);
+		TArray<UK2Node_FunctionEntry*> Entries;
+		if (NewGraph) NewGraph->GetNodesOfClass(Entries);
+		UK2Node_FunctionEntry* Entry = Entries.Num() == 1 ? Entries[0] : nullptr;
+		if (Entry) { Entry->NodePosX = 0; Entry->NodePosY = 0; }
+		bool bPinsCreated = Entry != nullptr;
+		for (const TSharedPtr<FJsonValue>& Value : *Inputs)
+		{
+			const TSharedPtr<FJsonObject> Parameter = Value->AsObject();
+			FString Name, Type;
+			FEdGraphPinType PinType;
+			bPinsCreated = bPinsCreated && Parameter.IsValid() && Parameter->TryGetStringField(TEXT("name"), Name)
+				&& Parameter->TryGetStringField(TEXT("type"), Type) && FunctionParameterPinType(Type, PinType)
+				&& Entry->CreateUserDefinedPin(FName(*Name), PinType, EGPD_Output, false)
+				&& Entry->FindPin(FName(*Name), EGPD_Output);
+		}
+		UK2Node_FunctionResult* ResultNode = nullptr;
+		if (bPinsCreated && bHasOutputs)
+		{
+			ResultNode = FBlueprintEditorUtils::FindOrCreateFunctionResultNode(Entry);
+			if (ResultNode) { ResultNode->NodePosX = 800; ResultNode->NodePosY = 0; }
+			bPinsCreated = ResultNode != nullptr;
+			for (const TSharedPtr<FJsonValue>& Value : *Outputs)
+			{
+				const TSharedPtr<FJsonObject> Parameter = Value->AsObject();
+				FString Name, Type;
+				FEdGraphPinType PinType;
+				bPinsCreated = bPinsCreated && Parameter.IsValid() && Parameter->TryGetStringField(TEXT("name"), Name)
+					&& Parameter->TryGetStringField(TEXT("type"), Type) && FunctionParameterPinType(Type, PinType)
+					&& ResultNode->CreateUserDefinedPin(FName(*Name), PinType, EGPD_Input, false)
+					&& ResultNode->FindPin(FName(*Name), EGPD_Input);
+			}
+		}
+		const bool bMutated = NewGraph && bPinsCreated && ExactFunctionShell(NewGraph, Inputs, Outputs);
+		TSharedPtr<FJsonObject> Mutation = Attempt(true, bMutated);
+		Mutation->SetNumberField(TEXT("created_graphs"), bMutated ? 1 : 0);
+		Mutation->SetNumberField(TEXT("created_terminals"), bMutated ? (bHasOutputs ? 2 : 1) : 0);
+		Evidence->SetObjectField(TEXT("mutation"), Mutation);
+		if (!bMutated) return RollbackFunction(TEXT("MUTATION"), TEXT("FUNCTION_SHELL_CREATION_FAILED"), false);
+		if (FaultCheckpoint == TEXT("AFTER_MUTATION") || FaultCheckpoint == TEXT("ROLLBACK_FAILURE")
+			|| FaultCheckpoint == TEXT("AFTER_ROLLBACK_BEFORE_FINAL_RECEIPT"))
+			return RollbackFunction(TEXT("MUTATION"), TEXT("FORCED_FAILURE_AFTER_MUTATION"), false);
+
+		TSharedPtr<FJsonObject> CompileEvidence;
+		const bool bCompiled = FaultCheckpoint == TEXT("BEFORE_COMPILE") ? false : CompileWithoutSave(Blueprint, CompileEvidence);
+		if (!CompileEvidence.IsValid()) CompileEvidence = Attempt(true, false);
+		Evidence->SetObjectField(TEXT("compile"), CompileEvidence);
+		if (!bCompiled) return RollbackFunction(TEXT("COMPILE"), TEXT("BLUEPRINT_COMPILE_FAILED"), false);
+		if (FaultCheckpoint == TEXT("AFTER_COMPILE_BEFORE_VERIFY"))
+			return RollbackFunction(TEXT("VERIFY"), TEXT("FORCED_AFTER_COMPILE_BEFORE_VERIFY"), false);
+		const bool bForcedVerifyFailure = FaultCheckpoint == TEXT("VERIFICATION_FAILURE");
+		const bool bVerified = !bForcedVerifyFailure && ExactFunctionGraph(Blueprint, FunctionName) == NewGraph
+			&& ExactFunctionShell(NewGraph, Inputs, Outputs) && ExactAssetInventory(Blueprint, BaselineInventory, FunctionName);
+		TSharedPtr<FJsonObject> Verification = Attempt(true, bVerified);
+		Verification->SetBoolField(TEXT("exact_function_shell"), bVerified);
+		Verification->SetBoolField(TEXT("original_graphs_unchanged"), bVerified);
+		Verification->SetStringField(TEXT("function_graph_guid"), NewGraph->GraphGuid.ToString(EGuidFormats::Digits));
+		Evidence->SetObjectField(TEXT("verification"), Verification);
+		const FString PostFingerprint = Sha256(FunctionName + TEXT("|") + Signature + TEXT("|")
+			+ NewGraph->GraphGuid.ToString(EGuidFormats::Digits));
+		Evidence->SetStringField(TEXT("post_semantic_fingerprint"), PostFingerprint);
+		if (!bVerified) return RollbackFunction(TEXT("VERIFY"), TEXT("EXACT_FUNCTION_SHELL_FAILED"), false);
+		if (FaultCheckpoint == TEXT("AFTER_VERIFY_BEFORE_SAVE"))
+			return RollbackFunction(TEXT("SAVE"), TEXT("FORCED_AFTER_VERIFY_BEFORE_SAVE"), false);
+		TSharedPtr<FJsonObject> SaveEvidence = Attempt(true, false);
+		Evidence->SetObjectField(TEXT("save"), SaveEvidence);
+		const bool bSaved = FaultCheckpoint != TEXT("SAVE_FAILURE") && UEditorAssetLibrary::SaveLoadedAsset(Blueprint, false);
+		SaveEvidence->SetBoolField(TEXT("succeeded"), bSaved);
+		if (!bSaved) return RollbackFunction(TEXT("SAVE"), TEXT("BLUEPRINT_SAVE_FAILED"), FaultCheckpoint != TEXT("SAVE_FAILURE"));
+		const bool bPersisted = !Package->IsDirty() && ExactFunctionGraph(Blueprint, FunctionName) == NewGraph
+			&& ExactFunctionShell(NewGraph, Inputs, Outputs) && ExactAssetInventory(Blueprint, BaselineInventory, FunctionName);
+		SaveEvidence->SetBoolField(TEXT("persisted_verified"), bPersisted);
+		SaveEvidence->SetBoolField(TEXT("package_clean"), !Package->IsDirty());
+		DirtyState->SetBoolField(TEXT("final"), Package->IsDirty());
+		Evidence->SetObjectField(TEXT("rollback"), Attempt(false, false));
+		TSharedPtr<FJsonObject> Observed = MakeShared<FJsonObject>();
+		Observed->SetStringField(TEXT("function_name"), FunctionName);
+		Observed->SetStringField(TEXT("function_graph_guid"), NewGraph->GraphGuid.ToString(EGuidFormats::Digits));
+		Observed->SetStringField(TEXT("deterministic_signature"), Signature);
+		Observed->SetBoolField(TEXT("verified"), bPersisted);
+		Evidence->SetObjectField(TEXT("observed_result"), Observed);
+		if (!bPersisted)
+		{
+			SetFailure(Receipt, TEXT("SAVE"), TEXT("PERSISTED_STATE_UNPROVEN"), TEXT("QUARANTINED"),
+				TEXT("Save returned but the persisted function shell could not be proven"));
+			return Complete(Receipt);
+		}
+		Receipt->SetStringField(TEXT("state"), TEXT("SUCCESS"));
+		return Complete(Receipt, FaultCheckpoint == TEXT("AFTER_SAVE_BEFORE_FINAL_RECEIPT"));
+	}
 	if (Operations && (Operations->Num() > 1
 		|| FirstOperationVersion == TEXT("graph.add-call-function-standard@1.0")
 		|| FirstOperationVersion == TEXT("graph.add-variable-get@1.0")
