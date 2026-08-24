@@ -29,13 +29,28 @@ describe("CallFunction Pass 4 qualification bridge", () => {
     expect(qualification).not.toContain("SaveLoadedAsset");
   });
 
-  it("validates narrow authored defaults with exact type and fixed enum identity", () => {
-    const codec = buildSpec.slice(buildSpec.indexOf("bool QualifiedDefaultRoundTrips"),
+  it("validates qualified authored defaults with exact types, fixed enum identity, and common structs", () => {
+    const codec = buildSpec.slice(buildSpec.indexOf("bool QualifiedDefaultMatchesType"),
       buildSpec.indexOf("bool ExactFunctionParameters"));
-    for (const name of ["bool", "byte", "int", "int64", "float", "double", "name", "string", "enum"])
+    for (const name of ["bool", "byte", "int", "int64", "float", "double", "name", "string", "enum",
+      "vector", "rotator"])
       expect(codec).toContain(`Codec == TEXT(\"${name}\")`);
     expect(codec).toContain("ExactExpectedPinType");
     expect(codec).toContain("EnumType == Enum->GetPathName()");
     expect(codec).toContain("EGetByNameFlags::CaseSensitive");
+    expect(codec).toContain("TBaseStructure<FVector>::Get()");
+    expect(codec).toContain("TBaseStructure<FRotator>::Get()");
+    expect(codec).not.toContain('Codec == TEXT("text")');
+  });
+
+  it("rejects invalid semantic defaults in live preflight before the mutation loop", () => {
+    const preflight = buildSpec.indexOf("PlannedLogicalCallFunctions");
+    const mutation = buildSpec.indexOf("enum class EAppliedKind", preflight);
+    expect(preflight).toBeGreaterThan(0);
+    expect(mutation).toBeGreaterThan(preflight);
+    const gate = buildSpec.slice(preflight, mutation);
+    expect(gate).toContain("QualifiedDefaultMatchesType");
+    expect(gate).toContain("ENUM_MEMBER_MISSING");
+    expect(gate).toContain("FAILED_PRE_MUTATION");
   });
 });

@@ -905,7 +905,8 @@ namespace
 			&& bTerminalWrapper == Actual.PinValueType.bTerminalIsUObjectWrapper;
 	}
 
-	bool QualifiedDefaultRoundTrips(const UEdGraphPin& Pin, const TSharedPtr<FJsonObject>& Encoded, const FString& Value)
+	bool QualifiedDefaultMatchesType(const FEdGraphPinType& PinType, const TSharedPtr<FJsonObject>& Encoded,
+		const FString& Value)
 	{
 		FString Version, Codec, UnrealValue;
 		const TSharedPtr<FJsonObject> ExpectedType = ObjectField(Encoded, TEXT("exact_pin_type"));
@@ -914,16 +915,18 @@ namespace
 			|| Version != TEXT("spacehead.call-function-default-codec@1.0")
 			|| !Encoded->TryGetStringField(TEXT("codec"), Codec)
 			|| !Encoded->TryGetStringField(TEXT("unreal_value"), UnrealValue)
-			|| !ExactExpectedPinType(ExpectedType, Pin.PinType)
-			|| Pin.PinType.ContainerType != EPinContainerType::None || Pin.PinType.bIsReference
-			|| Pin.PinType.bIsWeakPointer || Pin.PinType.bIsUObjectWrapper) return false;
-		const FString Category = Pin.PinType.PinCategory.ToString().ToLower();
-		if (Codec != TEXT("float") && Codec != TEXT("double") && UnrealValue != Value) return false;
+			|| !ExactExpectedPinType(ExpectedType, PinType)
+			|| PinType.ContainerType != EPinContainerType::None || PinType.bIsReference
+			|| PinType.bIsWeakPointer || PinType.bIsUObjectWrapper) return false;
+		const FString Category = PinType.PinCategory.ToString().ToLower();
+		const bool bNormalizedRepresentation = Codec == TEXT("float") || Codec == TEXT("double")
+			|| Codec == TEXT("vector") || Codec == TEXT("rotator");
+		if (!bNormalizedRepresentation && UnrealValue != Value) return false;
 		if (Codec == TEXT("bool")) return Category == TEXT("bool") && (Value == TEXT("true") || Value == TEXT("false"));
 		if (Codec == TEXT("byte"))
 		{
 			int32 Parsed = -1;
-			return Category == TEXT("byte") && !Pin.PinType.PinSubCategoryObject.IsValid()
+			return Category == TEXT("byte") && !PinType.PinSubCategoryObject.IsValid()
 				&& LexTryParseString(Parsed, *Value) && Parsed >= 0 && Parsed <= 255 && FString::FromInt(Parsed) == Value;
 		}
 		if (Codec == TEXT("int"))
@@ -940,7 +943,7 @@ namespace
 		{
 			double Requested = 0, Readback = 0;
 			return Category == TEXT("real")
-				&& Pin.PinType.PinSubCategory.ToString().Equals(Codec, ESearchCase::IgnoreCase)
+				&& PinType.PinSubCategory.ToString().Equals(Codec, ESearchCase::IgnoreCase)
 				&& LexTryParseString(Requested, *UnrealValue) && LexTryParseString(Readback, *Value)
 				&& Requested == Readback;
 		}
@@ -948,7 +951,7 @@ namespace
 		if (Codec == TEXT("string")) return Category == TEXT("string");
 		if (Codec == TEXT("enum"))
 		{
-			UEnum* Enum = Cast<UEnum>(Pin.PinType.PinSubCategoryObject.Get());
+			UEnum* Enum = Cast<UEnum>(PinType.PinSubCategoryObject.Get());
 			const TSharedPtr<FJsonObject> Semantic = ObjectField(Encoded, TEXT("semantic_value"));
 			FString EnumType, EnumValue;
 			return Category == TEXT("byte") && Enum && Semantic.IsValid()
@@ -956,7 +959,36 @@ namespace
 				&& Semantic->TryGetStringField(TEXT("value"), EnumValue) && EnumValue == Value
 				&& Enum->GetIndexByNameString(Value, EGetByNameFlags::CaseSensitive) != INDEX_NONE;
 		}
+		const TSharedPtr<FJsonObject> Semantic = ObjectField(Encoded, TEXT("semantic_value"));
+		UScriptStruct* Struct = Cast<UScriptStruct>(PinType.PinSubCategoryObject.Get());
+		if (Codec == TEXT("vector"))
+		{
+			double X = 0, Y = 0, Z = 0;
+			FVector Parsed = FVector::ZeroVector;
+			const TCHAR* End = Struct == TBaseStructure<FVector>::Get()
+				? Struct->ImportText(*Value, &Parsed, nullptr, PPF_None, nullptr, TEXT("Vector")) : nullptr;
+			return Category == TEXT("struct") && Semantic.IsValid() && Semantic->Values.Num() == 3
+				&& Semantic->TryGetNumberField(TEXT("x"), X) && Semantic->TryGetNumberField(TEXT("y"), Y)
+				&& Semantic->TryGetNumberField(TEXT("z"), Z) && End && *End == 0
+				&& Parsed.X == X && Parsed.Y == Y && Parsed.Z == Z;
+		}
+		if (Codec == TEXT("rotator"))
+		{
+			double Pitch = 0, Yaw = 0, Roll = 0;
+			FRotator Parsed = FRotator::ZeroRotator;
+			const TCHAR* End = Struct == TBaseStructure<FRotator>::Get()
+				? Struct->ImportText(*Value, &Parsed, nullptr, PPF_None, nullptr, TEXT("Rotator")) : nullptr;
+			return Category == TEXT("struct") && Semantic.IsValid() && Semantic->Values.Num() == 3
+				&& Semantic->TryGetNumberField(TEXT("pitch"), Pitch) && Semantic->TryGetNumberField(TEXT("yaw"), Yaw)
+				&& Semantic->TryGetNumberField(TEXT("roll"), Roll) && End && *End == 0
+				&& Parsed.Pitch == Pitch && Parsed.Yaw == Yaw && Parsed.Roll == Roll;
+		}
 		return false;
+	}
+
+	bool QualifiedDefaultRoundTrips(const UEdGraphPin& Pin, const TSharedPtr<FJsonObject>& Encoded, const FString& Value)
+	{
+		return QualifiedDefaultMatchesType(Pin.PinType, Encoded, Value);
 	}
 
 	bool ExactFunctionParameters(UFunction* Function, const TArray<TSharedPtr<FJsonValue>>* Expected)
@@ -1645,6 +1677,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		}
 
 		TMap<FString, UFunction*> PlannedCallFunctions;
+		TMap<FString, UFunction*> PlannedLogicalCallFunctions;
 		TArray<FString> PlannedCallFunctionGuids;
 		for (const TSharedPtr<FJsonValue>& Value : *Operations)
 		{
@@ -1693,6 +1726,47 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 				return Complete(Receipt);
 			}
 			PlannedCallFunctions.Add(OperationId, Function);
+			FString LogicalId;
+			if (!Payload->TryGetStringField(TEXT("logical_id"), LogicalId) || LogicalId.IsEmpty()
+				|| PlannedLogicalCallFunctions.Contains(LogicalId))
+			{
+				SetFailure(Receipt, TEXT("LIVE_PREFLIGHT"), TEXT("FUNCTION_RESOLUTION_MISMATCH"), TEXT("FAILED_PRE_MUTATION"),
+					TEXT("CallFunction logical identity is missing or duplicated"));
+				return Complete(Receipt);
+			}
+			PlannedLogicalCallFunctions.Add(LogicalId, Function);
+		}
+
+		for (const TSharedPtr<FJsonValue>& Value : *Operations)
+		{
+			const TSharedPtr<FJsonObject> PlannedOperation = Value->AsObject();
+			FString Version;
+			if (!PlannedOperation.IsValid() || !PlannedOperation->TryGetStringField(TEXT("operation_version"), Version)
+				|| Version != TEXT("graph.set-pin-default@1.0")) continue;
+			const TSharedPtr<FJsonObject> Payload = ObjectField(PlannedOperation, TEXT("semantic_payload"));
+			const TSharedPtr<FJsonObject> Encoded = ObjectField(Payload, TEXT("default_codec"));
+			const TSharedPtr<FJsonObject> Reference = ObjectField(Payload, TEXT("node_reference"));
+			FString Kind, LogicalId, PinName, DesiredValue, Codec;
+			if (!Encoded.IsValid()) continue;
+			Encoded->TryGetStringField(TEXT("codec"), Codec);
+			UFunction* Function = Reference.IsValid() && Reference->TryGetStringField(TEXT("kind"), Kind)
+				&& Kind == TEXT("logical") && Reference->TryGetStringField(TEXT("logical_id"), LogicalId)
+				? PlannedLogicalCallFunctions.FindRef(LogicalId) : nullptr;
+			FProperty* Property = nullptr;
+			if (Function && Payload->TryGetStringField(TEXT("pin_name"), PinName))
+				for (TFieldIterator<FProperty> It(Function); It && It->HasAnyPropertyFlags(CPF_Parm); ++It)
+					if (It->GetName() == PinName) { Property = *It; break; }
+			FEdGraphPinType PinType;
+			const bool bQualified = Property && Payload->TryGetStringField(TEXT("desired_unreal_value"), DesiredValue)
+				&& GetDefault<UEdGraphSchema_K2>()->ConvertPropertyToPinType(Property, PinType)
+				&& QualifiedDefaultMatchesType(PinType, Encoded, DesiredValue);
+			if (!bQualified)
+			{
+				SetFailure(Receipt, TEXT("LIVE_PREFLIGHT"), Codec == TEXT("enum")
+					? TEXT("ENUM_MEMBER_MISSING") : TEXT("INVALID_QUALIFIED_DEFAULT"), TEXT("FAILED_PRE_MUTATION"),
+					TEXT("The semantic default does not match the exact live pin type or an authoritative Unreal value"));
+				return Complete(Receipt);
+			}
 		}
 
 		enum class EAppliedKind { AddedNode, SetDefault, Connected, Disconnected };
