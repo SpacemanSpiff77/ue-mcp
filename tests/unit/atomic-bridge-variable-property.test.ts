@@ -41,6 +41,8 @@ describe("atomic Builder Variable/Property Pass 1", () => {
     expect(handler).not.toContain("CreatePin(EGPD_");
     expect(handler).toContain("PlannedVariableGuids");
     expect(handler).toContain("PlannedLogicalVariableGets");
+    expect(handler).toContain("PlannedLogicalVariableMemberNames");
+    expect(handler).toContain("Variable->VariableReference.GetMemberName().ToString() != *ExpectedMemberName");
     expect(handler).toContain("UK2Node_Variable* Variable = Cast<UK2Node_Variable>(Pair.Value)");
     expect(handler).toContain('SetBoolField(TEXT("logical_node_identity_exact")');
     expect(handler).toContain('SetBoolField(TEXT("applied_state_exact")');

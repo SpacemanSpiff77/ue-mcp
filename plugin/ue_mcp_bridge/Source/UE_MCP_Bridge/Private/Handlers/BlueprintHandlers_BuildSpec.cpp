@@ -1838,6 +1838,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 
 		TMap<FString, FProperty*> PlannedVariableProperties;
 		TMap<FString, FProperty*> PlannedLogicalVariableProperties;
+		TMap<FString, FString> PlannedLogicalVariableMemberNames;
 		TMap<FString, bool> PlannedLogicalVariableGets;
 		TMap<FString, bool> PlannedLogicalVariableSelfContexts;
 		TMap<FString, FString> PlannedLogicalVariableMemberGuids;
@@ -1892,6 +1893,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			}
 			PlannedVariableProperties.Add(OperationId, Property);
 			PlannedLogicalVariableProperties.Add(LogicalId, Property);
+			PlannedLogicalVariableMemberNames.Add(LogicalId, Member);
 			PlannedLogicalVariableGets.Add(LogicalId, bGet);
 			PlannedLogicalVariableSelfContexts.Add(LogicalId, bSelfContext);
 			PlannedLogicalVariableMemberGuids.Add(LogicalId, MemberGuid);
@@ -2626,15 +2628,15 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			}
 			else if (UK2Node_Variable* Variable = Cast<UK2Node_Variable>(Pair.Value))
 			{
-				FProperty* ExpectedProperty = PlannedLogicalVariableProperties.FindRef(Pair.Key);
+				const FString* ExpectedMemberName = PlannedLogicalVariableMemberNames.Find(Pair.Key);
 				const bool* bExpectedGet = PlannedLogicalVariableGets.Find(Pair.Key);
 				const bool* bExpectedSelfContext = PlannedLogicalVariableSelfContexts.Find(Pair.Key);
 				const FString* ExpectedMemberGuid = PlannedLogicalVariableMemberGuids.Find(Pair.Key);
 				const UClass* ExpectedClass = bExpectedGet && *bExpectedGet
 					? UK2Node_VariableGet::StaticClass() : UK2Node_VariableSet::StaticClass();
-				if (!ExpectedProperty || !bExpectedGet || !bExpectedSelfContext || !ExpectedMemberGuid
+				if (!ExpectedMemberName || !bExpectedGet || !bExpectedSelfContext || !ExpectedMemberGuid
 					|| Variable->GetClass() != ExpectedClass
-					|| Variable->VariableReference.GetMemberName() != ExpectedProperty->GetFName()
+					|| Variable->VariableReference.GetMemberName().ToString() != *ExpectedMemberName
 					|| !ExactMemberGuid(Variable->VariableReference.GetMemberGuid(), *ExpectedMemberGuid)
 					|| Variable->VariableReference.IsSelfContext() != *bExpectedSelfContext) bLogicalNodeIdentityExact = false;
 			}
