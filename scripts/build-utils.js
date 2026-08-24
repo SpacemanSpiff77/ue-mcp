@@ -56,6 +56,11 @@ function findUEBuildTool() {
 }
 
 function getProjectPaths() {
+  const projectOverride = process.env.UE_MCP_PROJECT_FILE?.trim();
+  if (projectOverride) {
+    const projectFile = path.resolve(projectOverride);
+    return { projectRoot: path.dirname(projectFile), projectFile };
+  }
   const projectRoot = path.resolve(__dirname, '..', 'tests', 'ue_mcp');
   const projectFile = path.join(projectRoot, 'ue_mcp.uproject');
   return { projectRoot, projectFile };

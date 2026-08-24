@@ -43,6 +43,7 @@ describe("atomic bridge exact build and schema identity", () => {
   it("generates commit metadata and fingerprints every qualified atomic implementation input", () => {
     const build = readFileSync(resolve(root, "plugin/ue_mcp_bridge/Source/UE_MCP_Bridge/UE_MCP_Bridge.Build.cs"), "utf8");
     const script = readFileSync(resolve(root, "scripts/build.js"), "utf8");
+    const buildUtils = readFileSync(resolve(root, "scripts/build-utils.js"), "utf8");
     const handler = readFileSync(resolve(root, "plugin/ue_mcp_bridge/Source/UE_MCP_Bridge/Private/Handlers/BlueprintHandlers_BuildSpec.cpp"), "utf8");
     for (const input of [
       "BlueprintHandlers.cpp", "BlueprintHandlers.h", "BlueprintHandlers_BuildSpec.cpp",
@@ -57,6 +58,7 @@ describe("atomic bridge exact build and schema identity", () => {
     expect(script).toContain("path.basename(projectFile, path.extname(projectFile))");
     expect(script).toContain("editorTarget");
     expect(script).not.toContain("'ue_mcpEditor'");
+    expect(buildUtils).toContain("process.env.UE_MCP_PROJECT_FILE");
     expect(script).toContain("-NoUBTMakefiles");
     expect(handler).toContain("AtomicBridgeBuildIdentity.generated.h");
     expect(handler).not.toContain("spacehead-pass2-atomic-build@1");
