@@ -1226,7 +1226,7 @@ namespace
 			|| !Payload->TryGetStringField(TEXT("struct_type_path"), StructPath) || StructPath.IsEmpty()
 			|| !Payload->TryGetStringField(TEXT("struct_type_name"), StructName) || StructName.IsEmpty()
 			|| !Payload->TryGetStringField(TEXT("selected_spawner"), Spawner)
-			|| Spawner != TEXT("/Script/BlueprintGraph.BlueprintNodeSpawner")
+			|| Spawner != TEXT("/Script/BlueprintGraph.BlueprintFieldNodeSpawner")
 			|| !Payload->TryGetStringField(TEXT("selected_k2_node_class"), NodeClass)
 			|| NodeClass != (Operation == TEXT("MAKE") ? TEXT("/Script/BlueprintGraph.K2Node_MakeStruct")
 				: TEXT("/Script/BlueprintGraph.K2Node_BreakStruct"))

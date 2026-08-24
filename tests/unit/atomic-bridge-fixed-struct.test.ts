@@ -29,6 +29,7 @@ describe("atomic bridge fixed-struct Pass 1 contract", () => {
 
   it("preflights exact identity before constructing dedicated K2 nodes", () => {
     expect(handler).toContain("ResolveExactStructOperation");
+    expect(handler).toContain("/Script/BlueprintGraph.BlueprintFieldNodeSpawner");
     expect(handler).toContain("UK2Node_MakeStruct");
     expect(handler).toContain("UK2Node_BreakStruct");
     expect(handler).toContain("StructNode->StructType = Struct");
