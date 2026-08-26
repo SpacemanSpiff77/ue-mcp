@@ -26,6 +26,11 @@ describe("atomic Builder Stage C bounded multi-operation contract", () => {
       .toBeLessThan(handler.indexOf("UEditorAssetLibrary::SaveLoadedAsset(Blueprint, false)"));
   });
 
+  it("admits both existing graph and existing function selectors for bounded multi-operation dispatch", () => {
+    expect(handler).toContain('SelectorKind != TEXT("graph") && SelectorKind != TEXT("function")');
+    expect(handler).toContain("ResolveTargetGraph(Blueprint, SelectorKind, SelectorName)");
+  });
+
   it("resolves new-node pins by unique semantic criteria and never inserts conversion nodes", () => {
     expect(handler).toContain("ResolveSemanticPin");
     expect(handler).toContain('TEXT("Condition"), EGPD_Input, TEXT("bool")');
