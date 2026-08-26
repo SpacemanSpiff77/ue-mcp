@@ -886,7 +886,11 @@ namespace
 			&& FromPin->Direction == EGPD_Output && ToPin->Direction == EGPD_Input
 			&& PinClassification(FromPin) == PinClassification(ToPin)
 			&& ExactStructuralPinType(FromPin, ToPin);
-		const bool bPinsClean = FromPin && ToPin && FromPreLinkCount == 0 && ToPreLinkCount == 0;
+		const bool bFromCardinalityClean = FromPin
+			&& (PinClassification(FromPin) == TEXT("data") || FromPreLinkCount == 0);
+		const bool bToCardinalityClean = ToPin
+			&& (PinClassification(ToPin) == TEXT("execution") || ToPreLinkCount == 0);
+		const bool bPinsClean = bFromCardinalityClean && bToCardinalityClean;
 		TArray<TSharedPtr<FJsonValue>> RejectionReasons;
 		auto Reject = [&](const TCHAR* Code) { RejectionReasons.Add(MakeShared<FJsonValueString>(Code)); };
 		if (!FromPin || !ToPin) Reject(TEXT("PIN_RESOLUTION_FAILED"));
@@ -1985,7 +1989,9 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		TMap<FString, UFunction*> PlannedWholeCallFunctions;
 		TMap<FString, FString> LogicalOperationIds;
 		TMap<FString, TMap<FString, FString>> FuturePins;
-		TSet<FString> ClaimedFuturePins;
+		TSet<FString> ClaimedFutureDataInputs;
+		TSet<FString> ClaimedFutureExecutionOutputs;
+		TSet<FString> ClaimedFutureConnections;
 		auto PinKey = [](const FString& Direction, const FString& Name) { return Direction + TEXT(":") + Name; };
 		auto ParameterCategory = [](const FString& Type) { return Type == TEXT("float") ? FString(TEXT("real")) : Type; };
 		TMap<FString, FString> EntryPins;
@@ -2156,10 +2162,14 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 					&& Classification == (FromCategory == TEXT("exec") ? TEXT("execution") : TEXT("data"));
 				const FString FromPinKey = PinKey(TEXT("output"), FromName);
 				const FString ToPinKey = PinKey(TEXT("input"), ToName);
+				const FString FromQualifiedPin = FromKey + TEXT(":") + FromPinKey;
+				const FString ToQualifiedPin = ToKey + TEXT(":") + ToPinKey;
+				const FString ConnectionKey = FromQualifiedPin + TEXT("->") + ToQualifiedPin;
 				bWholeFunctionPreflight = bWholeFunctionPreflight && FuturePins.FindRef(FromKey).FindRef(FromPinKey) == FromCategory
 					&& FuturePins.FindRef(ToKey).FindRef(ToPinKey) == ToCategory
-					&& !ClaimedFuturePins.Contains(FromKey + TEXT(":") + FromPinKey)
-					&& !ClaimedFuturePins.Contains(ToKey + TEXT(":") + ToPinKey);
+					&& !ClaimedFutureConnections.Contains(ConnectionKey)
+					&& (FromCategory != TEXT("exec") || !ClaimedFutureExecutionOutputs.Contains(FromQualifiedPin))
+					&& (ToCategory == TEXT("exec") || !ClaimedFutureDataInputs.Contains(ToQualifiedPin));
 				if (FromKey.StartsWith(TEXT("logical:")))
 				{
 					const FString Dependency = LogicalOperationIds.FindRef(FromKey.RightChop(8));
@@ -2174,8 +2184,9 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 				}
 				if (bWholeFunctionPreflight)
 				{
-					ClaimedFuturePins.Add(FromKey + TEXT(":") + FromPinKey);
-					ClaimedFuturePins.Add(ToKey + TEXT(":") + ToPinKey);
+					ClaimedFutureConnections.Add(ConnectionKey);
+					if (FromCategory == TEXT("exec")) ClaimedFutureExecutionOutputs.Add(FromQualifiedPin);
+					if (ToCategory != TEXT("exec")) ClaimedFutureDataInputs.Add(ToQualifiedPin);
 				}
 				else WholeFunctionPreflightFailure = TEXT("CONNECTION_BODY_MISMATCH");
 			}
@@ -2458,8 +2469,10 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 				const FPinConnectionResponse Response = FromPin && ToPin
 					? CastChecked<UEdGraphSchema_K2>(NewGraph->GetSchema())->CanCreateConnection(FromPin, ToPin)
 					: FPinConnectionResponse(CONNECT_RESPONSE_DISALLOW, FText::GetEmpty());
+				const bool bAlreadyConnected = FromPin && ToPin
+					&& FromPin->LinkedTo.Contains(ToPin) && ToPin->LinkedTo.Contains(FromPin);
 				bBodyMutated = FromPin && ToPin && FromNode != ToNode && FromCategory == ToCategory
-					&& FromPin->LinkedTo.IsEmpty() && ToPin->LinkedTo.IsEmpty()
+					&& !bAlreadyConnected
 					&& Response.Response == CONNECT_RESPONSE_MAKE
 					&& CastChecked<UEdGraphSchema_K2>(NewGraph->GetSchema())->TryCreateConnection(FromPin, ToPin)
 					&& FromPin->LinkedTo.Contains(ToPin) && ToPin->LinkedTo.Contains(FromPin);
@@ -3594,7 +3607,6 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 				bool bReciprocalVerified = false;
 				if (Version == TEXT("graph.connect-pins@1.0") && FromPin && ToPin && FromNode != ToNode
 					&& FromCategory.Equals(ToCategory, ESearchCase::IgnoreCase) && !bConnected
-					&& FromPin->LinkedTo.IsEmpty() && ToPin->LinkedTo.IsEmpty()
 					&& CompatibilityResponse.Response == CONNECT_RESPONSE_MAKE)
 				{
 					bTryAttempted = true;
