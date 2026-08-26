@@ -24,6 +24,7 @@ describe("atomic Builder Pass 3 recovery boundary", () => {
 
   it("keeps persistent monotonic fencing and rejects corrupt or non-increasing records", () => {
     expect(handler).toContain('TEXT("SpaceheadBuilder"), TEXT("Fencing")');
+    expect(handler).toContain('Sha256(EnvironmentDigest + TEXT("|") + TargetIdentity)');
     expect(handler).toContain("Fields.Num() != 3 || !Fields[0].IsNumeric()");
     expect(handler).toContain("Sequence <= ExistingSequence");
     expect(handler).toContain("Handle->Flush(true)");

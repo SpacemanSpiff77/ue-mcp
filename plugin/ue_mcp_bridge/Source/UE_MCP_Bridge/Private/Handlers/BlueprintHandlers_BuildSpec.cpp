@@ -320,6 +320,22 @@ namespace
 		return true;
 	}
 
+	FString EngineIdentity();
+
+	bool CurrentEnvironmentDigest(FString& Digest)
+	{
+		FString InputDigest;
+		FString OutputDigest;
+		if (!ExactBridgeBuildIdentityAvailable()
+			|| !AtomicSchemaDigest(TEXT("request-v2.schema.json"), InputSchemaVersion, InputDigest)
+			|| !AtomicSchemaDigest(TEXT("receipt-v2.schema.json"), OutputSchemaVersion, OutputDigest))
+			return false;
+		Digest = Sha256(EngineIdentity() + TEXT("|") + UeMcpVersion + TEXT("|") + BridgeVersion + TEXT("|")
+			+ UE_MCP_AtomicBuildIdentity::GitCommit + TEXT("|") + UE_MCP_AtomicBuildIdentity::PluginBuildIdentity
+			+ TEXT("|") + InputDigest + TEXT("|") + OutputDigest);
+		return ValidHash(Digest);
+	}
+
 	TSharedPtr<FJsonObject> CloneObject(const TSharedPtr<FJsonObject>& Object)
 	{
 		TSharedPtr<FJsonObject> Clone;
@@ -1517,21 +1533,23 @@ namespace
 		return bSuccess;
 	}
 
-	FString FencingFile(const FString& TargetIdentity)
+	FString FencingFile(const FString& TargetIdentity, const FString& EnvironmentDigest)
 	{
 		const FString Directory = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("SpaceheadBuilder"), TEXT("Fencing"));
 		IFileManager::Get().MakeDirectory(*Directory, true);
-		return FPaths::Combine(Directory, Sha256(TargetIdentity) + TEXT(".txt"));
+		return FPaths::Combine(Directory, Sha256(EnvironmentDigest + TEXT("|") + TargetIdentity) + TEXT(".txt"));
 	}
 
 	bool AcceptFencing(
 		const FString& TargetIdentity,
+		const FString& EnvironmentDigest,
 		const FString& TransactionId,
 		const FString& Token,
 		int64 Sequence)
 	{
-		if (TargetIdentity.IsEmpty() || TransactionId.IsEmpty() || Token.IsEmpty() || Sequence < 1) return false;
-		const FString Path = FencingFile(TargetIdentity);
+		if (TargetIdentity.IsEmpty() || !ValidHash(EnvironmentDigest)
+			|| TransactionId.IsEmpty() || Token.IsEmpty() || Sequence < 1) return false;
+		const FString Path = FencingFile(TargetIdentity, EnvironmentDigest);
 		FString Existing;
 		if (FFileHelper::LoadFileToString(Existing, *Path))
 		{
@@ -1556,6 +1574,48 @@ namespace
 		}
 		Handle.Reset();
 		return IFileManager::Get().Move(*Path, *Temporary, true, true, false, true);
+	}
+
+	bool AcceptFencingEvidence(
+		const TSharedPtr<FJsonObject>& Fencing,
+		const TSharedPtr<FJsonObject>& Plan,
+		const FString& ExpectedTargetIdentity,
+		const FString& ExpectedLockOwner,
+		const FString& TransactionId)
+	{
+		if (!Fencing.IsValid() || !Plan.IsValid()) return false;
+		FString TargetIdentity;
+		FString Token;
+		FString LockOwner;
+		FString EnvironmentDigest;
+		FString BridgeCommit;
+		FString BuildFingerprint;
+		FString PluginBuildIdentity;
+		FString QualificationDigest;
+		FString PlanQualificationDigest;
+		FString CurrentDigest;
+		double SequenceNumber = 0;
+		return CurrentEnvironmentDigest(CurrentDigest)
+			&& Fencing->TryGetStringField(TEXT("target_identity"), TargetIdentity)
+			&& TargetIdentity == ExpectedTargetIdentity
+			&& Fencing->TryGetStringField(TEXT("fencing_token"), Token)
+			&& Fencing->TryGetStringField(TEXT("lock_owner_request_id"), LockOwner)
+			&& LockOwner == ExpectedLockOwner
+			&& Fencing->TryGetNumberField(TEXT("fencing_sequence"), SequenceNumber)
+			&& SequenceNumber >= 1 && FMath::FloorToDouble(SequenceNumber) == SequenceNumber
+			&& Fencing->TryGetStringField(TEXT("environment_digest"), EnvironmentDigest)
+			&& EnvironmentDigest == CurrentDigest
+			&& Fencing->TryGetStringField(TEXT("bridge_git_commit"), BridgeCommit)
+			&& BridgeCommit == UE_MCP_AtomicBuildIdentity::GitCommit
+			&& Fencing->TryGetStringField(TEXT("bridge_build_fingerprint"), BuildFingerprint)
+			&& BuildFingerprint == UE_MCP_AtomicBuildIdentity::BuildFingerprint
+			&& Fencing->TryGetStringField(TEXT("plugin_build_identity"), PluginBuildIdentity)
+			&& PluginBuildIdentity == UE_MCP_AtomicBuildIdentity::PluginBuildIdentity
+			&& Fencing->TryGetStringField(TEXT("capability_qualification_digest"), QualificationDigest)
+			&& Plan->TryGetStringField(TEXT("capability_qualification_digest"), PlanQualificationDigest)
+			&& QualificationDigest == PlanQualificationDigest
+			&& ValidHash(QualificationDigest)
+			&& AcceptFencing(TargetIdentity, EnvironmentDigest, TransactionId, Token, static_cast<int64>(SequenceNumber));
 	}
 
 	FString DurableExecutionFile(const FString& TransactionId, const FString& CorrelationId)
@@ -1681,18 +1741,13 @@ namespace
 
 	TSharedPtr<FJsonObject> Readiness()
 	{
-		FString InputDigest;
-		FString OutputDigest;
-		const bool bSchemasAvailable = AtomicSchemaDigest(TEXT("request-v2.schema.json"), InputSchemaVersion, InputDigest)
-			&& AtomicSchemaDigest(TEXT("receipt-v2.schema.json"), OutputSchemaVersion, OutputDigest);
+		FString EnvironmentDigest;
+		const bool bEnvironmentAvailable = CurrentEnvironmentDigest(EnvironmentDigest);
 		TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 		Result->SetStringField(TEXT("contract_version"), ContractVersion);
-		Result->SetBoolField(TEXT("ready"), ExactBridgeBuildIdentityAvailable() && bSchemasAvailable);
+		Result->SetBoolField(TEXT("ready"), bEnvironmentAvailable);
 		Result->SetStringField(TEXT("bridge_identity"), EndpointIdentity);
-		Result->SetStringField(TEXT("environment_digest"), Sha256(
-			EngineIdentity() + TEXT("|") + UeMcpVersion + TEXT("|") + BridgeVersion + TEXT("|")
-			+ UE_MCP_AtomicBuildIdentity::GitCommit + TEXT("|") + UE_MCP_AtomicBuildIdentity::PluginBuildIdentity
-			+ TEXT("|") + InputDigest + TEXT("|") + OutputDigest));
+		Result->SetStringField(TEXT("environment_digest"), EnvironmentDigest);
 		Result->SetStringField(TEXT("observed_at"), FDateTime::UtcNow().ToIso8601());
 		Result->SetStringField(TEXT("raw_method_identity"), RawMethodIdentity);
 		return Result;
@@ -2200,15 +2255,8 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			return Complete(Receipt);
 		}
 
-		FString TargetIdentity, FencingToken, LockOwner;
-		double FencingSequenceNumber = 0;
 		const FString ExpectedTargetIdentity = PackagePath + TEXT(":") + BlueprintName;
-		if (!Fencing->TryGetStringField(TEXT("target_identity"), TargetIdentity) || TargetIdentity != ExpectedTargetIdentity
-			|| !Fencing->TryGetStringField(TEXT("fencing_token"), FencingToken)
-			|| !Fencing->TryGetStringField(TEXT("lock_owner_request_id"), LockOwner) || LockOwner != SpecRequestId
-			|| !Fencing->TryGetNumberField(TEXT("fencing_sequence"), FencingSequenceNumber)
-			|| FencingSequenceNumber < 1 || FMath::FloorToDouble(FencingSequenceNumber) != FencingSequenceNumber
-			|| !AcceptFencing(TargetIdentity, TransactionId, FencingToken, static_cast<int64>(FencingSequenceNumber)))
+		if (!AcceptFencingEvidence(Fencing, Plan, ExpectedTargetIdentity, SpecRequestId, TransactionId))
 		{
 			SetFailure(Receipt, TEXT("CONCURRENCY"), TEXT("STALE_OR_INVALID_FENCING"), TEXT("FAILED_PRE_MUTATION"),
 				TEXT("Bridge fencing validation failed closed"));
@@ -2637,15 +2685,8 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			}
 		}
 
-		FString TargetIdentity, FencingToken, LockOwner;
-		double FencingSequenceNumber = 0;
 		const FString ExpectedTargetIdentity = PackagePath + TEXT(":") + BlueprintName;
-		if (!Fencing->TryGetStringField(TEXT("target_identity"), TargetIdentity) || TargetIdentity != ExpectedTargetIdentity
-			|| !Fencing->TryGetStringField(TEXT("fencing_token"), FencingToken)
-			|| !Fencing->TryGetStringField(TEXT("lock_owner_request_id"), LockOwner) || LockOwner != SpecRequestId
-			|| !Fencing->TryGetNumberField(TEXT("fencing_sequence"), FencingSequenceNumber)
-			|| FencingSequenceNumber < 1 || FMath::FloorToDouble(FencingSequenceNumber) != FencingSequenceNumber
-			|| !AcceptFencing(TargetIdentity, TransactionId, FencingToken, static_cast<int64>(FencingSequenceNumber)))
+		if (!AcceptFencingEvidence(Fencing, Plan, ExpectedTargetIdentity, SpecRequestId, TransactionId))
 		{
 			SetFailure(Receipt, TEXT("CONCURRENCY"), TEXT("STALE_OR_INVALID_FENCING"), TEXT("FAILED_PRE_MUTATION"),
 				TEXT("Bridge fencing validation failed closed"));
@@ -3975,18 +4016,8 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			return Complete(Receipt);
 		}
 
-		FString TargetIdentity;
-		FString FencingToken;
-		FString LockOwner;
-		double FencingSequenceNumber = 0;
 		const FString ExpectedTargetIdentity = PackagePath + TEXT(":") + BlueprintName;
-		if (!Fencing->TryGetStringField(TEXT("target_identity"), TargetIdentity)
-			|| TargetIdentity != ExpectedTargetIdentity
-			|| !Fencing->TryGetStringField(TEXT("fencing_token"), FencingToken)
-			|| !Fencing->TryGetStringField(TEXT("lock_owner_request_id"), LockOwner) || LockOwner != SpecRequestId
-			|| !Fencing->TryGetNumberField(TEXT("fencing_sequence"), FencingSequenceNumber)
-			|| FencingSequenceNumber < 1 || FMath::FloorToDouble(FencingSequenceNumber) != FencingSequenceNumber
-			|| !AcceptFencing(TargetIdentity, TransactionId, FencingToken, static_cast<int64>(FencingSequenceNumber)))
+		if (!AcceptFencingEvidence(Fencing, Plan, ExpectedTargetIdentity, SpecRequestId, TransactionId))
 		{
 			SetFailure(Receipt, TEXT("CONCURRENCY"), TEXT("STALE_OR_INVALID_FENCING"), TEXT("FAILED_PRE_MUTATION"),
 				TEXT("Bridge fencing validation failed closed"));
@@ -4575,18 +4606,8 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		return Complete(Receipt);
 	}
 
-	FString TargetIdentity;
-	FString FencingToken;
-	FString LockOwner;
-	double FencingSequenceNumber = 0;
 	const FString ExpectedTargetIdentity = PackagePath + TEXT(":") + BlueprintName;
-	if (!Fencing->TryGetStringField(TEXT("target_identity"), TargetIdentity)
-		|| TargetIdentity != ExpectedTargetIdentity
-		|| !Fencing->TryGetStringField(TEXT("fencing_token"), FencingToken)
-		|| !Fencing->TryGetStringField(TEXT("lock_owner_request_id"), LockOwner) || LockOwner != SpecRequestId
-		|| !Fencing->TryGetNumberField(TEXT("fencing_sequence"), FencingSequenceNumber)
-		|| FencingSequenceNumber < 1 || FMath::FloorToDouble(FencingSequenceNumber) != FencingSequenceNumber
-		|| !AcceptFencing(TargetIdentity, TransactionId, FencingToken, static_cast<int64>(FencingSequenceNumber)))
+	if (!AcceptFencingEvidence(Fencing, Plan, ExpectedTargetIdentity, SpecRequestId, TransactionId))
 	{
 		SetFailure(Receipt, TEXT("CONCURRENCY"), TEXT("STALE_OR_INVALID_FENCING"), TEXT("FAILED_PRE_MUTATION"), TEXT("Bridge fencing validation failed closed"));
 		return Complete(Receipt);

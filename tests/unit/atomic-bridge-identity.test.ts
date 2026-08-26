@@ -26,7 +26,7 @@ function schemaDigest(file: string): string {
 
 describe("atomic bridge exact build and schema identity", () => {
   it("derives stable structural schema digests from the packaged language-neutral contracts", () => {
-    expect(schemaDigest("request-v2.schema.json")).toBe("e08d0c275a29c2190729ee0ccaea5d4d983b980f91d0206cb0dac405537f46aa");
+    expect(schemaDigest("request-v2.schema.json")).toBe("bd37dd69c7da7c90a85335fdfca557a669bd841abf2f5d7c3914312764348ca8");
     expect(schemaDigest("receipt-v2.schema.json")).toBe("918656a8f6f7d4cab12724598f89c311828ef6ae7a2e56361d47d11a082b8912");
   });
 

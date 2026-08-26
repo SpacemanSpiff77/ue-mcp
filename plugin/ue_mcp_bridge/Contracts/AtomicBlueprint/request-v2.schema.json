@@ -126,11 +126,15 @@
     },
     "fencing": {
       "type": "object", "additionalProperties": false,
-      "required": ["target_identity", "fencing_token", "fencing_sequence", "lock_owner_request_id", "issued_at"],
+      "required": ["target_identity", "fencing_token", "fencing_sequence", "lock_owner_request_id", "issued_at", "environment_digest", "bridge_git_commit", "bridge_build_fingerprint", "plugin_build_identity", "capability_qualification_digest"],
       "properties": {
         "target_identity": { "$ref": "#/$defs/nonEmpty" }, "fencing_token": { "$ref": "#/$defs/nonEmpty" },
         "fencing_sequence": { "type": "integer", "minimum": 1 }, "lock_owner_request_id": { "$ref": "#/$defs/nonEmpty" },
-        "issued_at": { "type": "string" }
+        "issued_at": { "type": "string" }, "environment_digest": { "$ref": "#/$defs/sha256" },
+        "bridge_git_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "bridge_build_fingerprint": { "$ref": "#/$defs/sha256" },
+        "plugin_build_identity": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "capability_qualification_digest": { "$ref": "#/$defs/sha256" }
       }
     },
     "testHooks": {
