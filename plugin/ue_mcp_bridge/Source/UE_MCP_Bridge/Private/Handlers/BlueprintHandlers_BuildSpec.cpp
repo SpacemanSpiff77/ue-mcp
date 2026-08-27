@@ -2406,14 +2406,46 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 
 		TMap<FString, UEdGraphNode*> WholeLogicalNodes;
 		TArray<TPair<UEdGraphPin*, UEdGraphPin*>> WholeConnections;
-		auto CountFunctionLinks = [&]()
+		TMap<FString, TPair<UEdGraphPin*, UEdGraphPin*>> ExpectedWholeConnections;
+		TSet<FString> InitialShellConnectionKeys;
+		auto WholeConnectionKey = [&](const UEdGraphPin* FromPin, const UEdGraphPin* ToPin)
 		{
-			int32 DirectedLinks = 0;
-			for (UEdGraphNode* Node : NewGraph->Nodes) if (Node) for (UEdGraphPin* Pin : Node->Pins)
-				if (Pin) DirectedLinks += Pin->LinkedTo.Num();
-			return DirectedLinks / 2;
+			const UEdGraphNode* FromNode = FromPin ? FromPin->GetOwningNode() : nullptr;
+			const UEdGraphNode* ToNode = ToPin ? ToPin->GetOwningNode() : nullptr;
+			return FromNode && ToNode && FromNode->NodeGuid.IsValid() && ToNode->NodeGuid.IsValid()
+				&& FromPin->PinId.IsValid() && ToPin->PinId.IsValid()
+				? FString::Printf(TEXT("%s|%s:%s:output:%s:%s->%s:%s:input:%s:%s"),
+					*NewGraph->GraphGuid.ToString(EGuidFormats::Digits),
+					*FromNode->NodeGuid.ToString(EGuidFormats::Digits), *FromPin->PinId.ToString(EGuidFormats::Digits),
+					*FromPin->PinName.ToString(), *FromPin->PinType.PinCategory.ToString(),
+					*ToNode->NodeGuid.ToString(EGuidFormats::Digits), *ToPin->PinId.ToString(EGuidFormats::Digits),
+					*ToPin->PinName.ToString(), *ToPin->PinType.PinCategory.ToString())
+				: FString();
 		};
-		const int32 ShellConnectionCount = CountFunctionLinks();
+		bool bExpectedConnectionModelValid = true;
+		for (UEdGraphNode* Node : NewGraph->Nodes) if (Node) for (UEdGraphPin* Pin : Node->Pins)
+		{
+			if (!Pin || Pin->Direction != EGPD_Output) continue;
+			for (UEdGraphPin* Linked : Pin->LinkedTo)
+			{
+				const FString Key = WholeConnectionKey(Pin, Linked);
+				if (!Linked || Linked->Direction != EGPD_Input || Linked->GetOwningNode()->GetGraph() != NewGraph
+					|| !Linked->LinkedTo.Contains(Pin) || Key.IsEmpty() || ExpectedWholeConnections.Contains(Key))
+					bExpectedConnectionModelValid = false;
+				else
+				{
+					ExpectedWholeConnections.Add(Key, TPair<UEdGraphPin*, UEdGraphPin*>(Pin, Linked));
+					InitialShellConnectionKeys.Add(Key);
+				}
+			}
+		}
+		auto RemoveExpectedConnectionsForPin = [&](const UEdGraphPin* Pin)
+		{
+			TArray<FString> Removed;
+			for (const auto& Pair : ExpectedWholeConnections)
+				if (Pair.Value.Key == Pin || Pair.Value.Value == Pin) Removed.Add(Pair.Key);
+			for (const FString& Key : Removed) ExpectedWholeConnections.Remove(Key);
+		};
 		auto ResolveWholeReference = [&](const TSharedPtr<FJsonObject>& Reference) -> UEdGraphNode*
 		{
 			FString Kind, Identity;
@@ -2538,7 +2570,20 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 					&& IsNativeDirectConnectionMakingResponse(Response.Response.GetValue())
 					&& CastChecked<UEdGraphSchema_K2>(NewGraph->GetSchema())->TryCreateConnection(FromPin, ToPin)
 					&& FromPin->LinkedTo.Contains(ToPin) && ToPin->LinkedTo.Contains(FromPin);
-				if (bBodyMutated) WholeConnections.Add(TPair<UEdGraphPin*, UEdGraphPin*>(FromPin, ToPin));
+				if (bBodyMutated)
+				{
+					if (Response.Response == CONNECT_RESPONSE_BREAK_OTHERS_A
+						|| Response.Response == CONNECT_RESPONSE_BREAK_OTHERS_AB) RemoveExpectedConnectionsForPin(FromPin);
+					if (Response.Response == CONNECT_RESPONSE_BREAK_OTHERS_B
+						|| Response.Response == CONNECT_RESPONSE_BREAK_OTHERS_AB) RemoveExpectedConnectionsForPin(ToPin);
+					const FString Key = WholeConnectionKey(FromPin, ToPin);
+					bBodyMutated = !Key.IsEmpty() && !ExpectedWholeConnections.Contains(Key);
+					if (bBodyMutated)
+					{
+						ExpectedWholeConnections.Add(Key, TPair<UEdGraphPin*, UEdGraphPin*>(FromPin, ToPin));
+						WholeConnections.Add(TPair<UEdGraphPin*, UEdGraphPin*>(FromPin, ToPin));
+					}
+				}
 				else BodyFailureCode = TEXT("CONNECT_PINS_FAILED");
 			}
 			else { bBodyMutated = false; BodyFailureCode = TEXT("UNSUPPORTED_WHOLE_FUNCTION_OPERATION"); }
@@ -2579,7 +2624,26 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 			}
 			else if (!Cast<UK2Node_IfThenElse>(Pair.Value)) bBodyNodesExact = false;
 		}
-		bool bBodyConnectionsExact = CountFunctionLinks() == ShellConnectionCount + WholeConnections.Num();
+		TMap<FString, TPair<UEdGraphPin*, UEdGraphPin*>> ObservedWholeConnections;
+		TArray<FString> DuplicateObservedConnectionKeys;
+		bool bObservedConnectionSetValid = true;
+		for (UEdGraphNode* Node : NewGraph->Nodes) if (Node) for (UEdGraphPin* Pin : Node->Pins)
+		{
+			if (!Pin || Pin->Direction != EGPD_Output) continue;
+			for (UEdGraphPin* Linked : Pin->LinkedTo)
+			{
+				const FString Key = WholeConnectionKey(Pin, Linked);
+				if (!Linked || Linked->Direction != EGPD_Input || Linked->GetOwningNode()->GetGraph() != NewGraph
+					|| !Linked->LinkedTo.Contains(Pin) || Key.IsEmpty()) bObservedConnectionSetValid = false;
+				else if (ObservedWholeConnections.Contains(Key)) DuplicateObservedConnectionKeys.Add(Key);
+				else ObservedWholeConnections.Add(Key, TPair<UEdGraphPin*, UEdGraphPin*>(Pin, Linked));
+			}
+		}
+		bool bBodyConnectionsExact = bExpectedConnectionModelValid && bObservedConnectionSetValid
+			&& DuplicateObservedConnectionKeys.Num() == 0
+			&& ObservedWholeConnections.Num() == ExpectedWholeConnections.Num();
+		for (const auto& Pair : ExpectedWholeConnections)
+			if (!ObservedWholeConnections.Contains(Pair.Key)) bBodyConnectionsExact = false;
 		for (const TPair<UEdGraphPin*, UEdGraphPin*>& Pair : WholeConnections)
 			if (!Pair.Key || !Pair.Value || !Pair.Key->LinkedTo.Contains(Pair.Value) || !Pair.Value->LinkedTo.Contains(Pair.Key))
 				bBodyConnectionsExact = false;
@@ -2592,10 +2656,91 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 		Verification->SetBoolField(TEXT("exact_connection_set"), bBodyConnectionsExact);
 		Verification->SetBoolField(TEXT("original_graphs_unchanged"), ExactAssetInventory(Blueprint, BaselineInventory, FunctionName));
 		Verification->SetStringField(TEXT("function_graph_guid"), NewGraph->GraphGuid.ToString(EGuidFormats::Digits));
+		Verification->SetNumberField(TEXT("expected_connection_count"), ExpectedWholeConnections.Num());
+		Verification->SetNumberField(TEXT("observed_connection_count"), ObservedWholeConnections.Num() + DuplicateObservedConnectionKeys.Num());
+		auto LogicalNodeIdentity = [&](const UEdGraphNode* Node)
+		{
+			if (Node == Entry) return FString::Printf(TEXT("terminal:entry:%s"), *OperationId);
+			if (Node == ResultNode) return FString::Printf(TEXT("terminal:return:%s"), *OperationId);
+			for (const auto& Pair : WholeLogicalNodes) if (Pair.Value == Node)
+				return FString::Printf(TEXT("logical:%s"), *Pair.Key);
+			return Node && Node->NodeGuid.IsValid()
+				? FString::Printf(TEXT("existing:%s"), *Node->NodeGuid.ToString(EGuidFormats::Digits)) : FString(TEXT("unresolved"));
+		};
+		auto ConnectionDiagnostic = [&](const FString& Key, const TPair<UEdGraphPin*, UEdGraphPin*>& Pair,
+			const FString& Membership)
+		{
+			TSharedPtr<FJsonObject> Value = MakeShared<FJsonObject>();
+			const UEdGraphNode* FromNode = Pair.Key ? Pair.Key->GetOwningNode() : nullptr;
+			const UEdGraphNode* ToNode = Pair.Value ? Pair.Value->GetOwningNode() : nullptr;
+			Value->SetStringField(TEXT("graph_identity"), NewGraph->GraphGuid.ToString(EGuidFormats::Digits));
+			Value->SetStringField(TEXT("function_identity"), FunctionName);
+			Value->SetStringField(TEXT("source_node_identity"), LogicalNodeIdentity(FromNode));
+			Value->SetStringField(TEXT("source_node_guid"), FromNode ? FromNode->NodeGuid.ToString(EGuidFormats::Digits) : FString());
+			Value->SetStringField(TEXT("source_logical_identity"), LogicalNodeIdentity(FromNode));
+			Value->SetStringField(TEXT("source_pin_name"), Pair.Key ? Pair.Key->PinName.ToString() : FString());
+			Value->SetStringField(TEXT("source_pin_id"), Pair.Key ? Pair.Key->PinId.ToString(EGuidFormats::Digits) : FString());
+			Value->SetStringField(TEXT("source_pin_direction"), TEXT("output"));
+			Value->SetStringField(TEXT("destination_node_identity"), LogicalNodeIdentity(ToNode));
+			Value->SetStringField(TEXT("destination_node_guid"), ToNode ? ToNode->NodeGuid.ToString(EGuidFormats::Digits) : FString());
+			Value->SetStringField(TEXT("destination_logical_identity"), LogicalNodeIdentity(ToNode));
+			Value->SetStringField(TEXT("destination_pin_name"), Pair.Value ? Pair.Value->PinName.ToString() : FString());
+			Value->SetStringField(TEXT("destination_pin_id"), Pair.Value ? Pair.Value->PinId.ToString(EGuidFormats::Digits) : FString());
+			Value->SetStringField(TEXT("destination_pin_direction"), TEXT("input"));
+			const bool bExecution = Pair.Key && Pair.Key->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec;
+			Value->SetStringField(TEXT("classification"), bExecution ? TEXT("execution") : TEXT("data"));
+			Value->SetStringField(TEXT("canonical_connection_identity"), Key);
+			Value->SetStringField(TEXT("canonicalization"),
+				TEXT("graph-guid|node-guid:pin-guid:direction:pin-name:pin-category->node-guid:pin-guid:direction:pin-name:pin-category"));
+			Value->SetStringField(TEXT("membership"), Membership);
+			Value->SetBoolField(TEXT("automatically_generated"), InitialShellConnectionKeys.Contains(Key));
+			return MakeShared<FJsonValueObject>(Value);
+		};
+		auto SortedKeys = [](const TMap<FString, TPair<UEdGraphPin*, UEdGraphPin*>>& Connections)
+		{
+			TArray<FString> Keys;
+			Connections.GetKeys(Keys);
+			Keys.Sort();
+			return Keys;
+		};
+		TArray<TSharedPtr<FJsonValue>> ExpectedConnectionEvidence;
+		TArray<TSharedPtr<FJsonValue>> ObservedConnectionEvidence;
+		TArray<TSharedPtr<FJsonValue>> MissingConnectionEvidence;
+		TArray<TSharedPtr<FJsonValue>> UnexpectedConnectionEvidence;
+		TArray<TSharedPtr<FJsonValue>> AutomaticConnectionEvidence;
+		for (const FString& Key : SortedKeys(ExpectedWholeConnections))
+		{
+			const bool bObserved = ObservedWholeConnections.Contains(Key);
+			const TSharedPtr<FJsonValue> Diagnostic = ConnectionDiagnostic(Key, ExpectedWholeConnections.FindChecked(Key),
+				bObserved ? TEXT("both") : TEXT("expected"));
+			ExpectedConnectionEvidence.Add(Diagnostic);
+			if (!bObserved) MissingConnectionEvidence.Add(Diagnostic);
+			if (bObserved && InitialShellConnectionKeys.Contains(Key)) AutomaticConnectionEvidence.Add(Diagnostic);
+		}
+		for (const FString& Key : SortedKeys(ObservedWholeConnections))
+		{
+			const bool bExpected = ExpectedWholeConnections.Contains(Key);
+			const TSharedPtr<FJsonValue> Diagnostic = ConnectionDiagnostic(Key, ObservedWholeConnections.FindChecked(Key),
+				bExpected ? TEXT("both") : TEXT("observed"));
+			ObservedConnectionEvidence.Add(Diagnostic);
+			if (!bExpected) UnexpectedConnectionEvidence.Add(Diagnostic);
+			if (!bExpected && InitialShellConnectionKeys.Contains(Key)) AutomaticConnectionEvidence.Add(Diagnostic);
+		}
+		TArray<TSharedPtr<FJsonValue>> DuplicateConnectionEvidence;
+		DuplicateObservedConnectionKeys.Sort();
+		for (const FString& Key : DuplicateObservedConnectionKeys)
+			DuplicateConnectionEvidence.Add(MakeShared<FJsonValueString>(Key));
+		Verification->SetArrayField(TEXT("expected_connections"), ExpectedConnectionEvidence);
+		Verification->SetArrayField(TEXT("observed_connections"), ObservedConnectionEvidence);
+		Verification->SetArrayField(TEXT("missing_expected_connections"), MissingConnectionEvidence);
+		Verification->SetArrayField(TEXT("unexpected_observed_connections"), UnexpectedConnectionEvidence);
+		Verification->SetArrayField(TEXT("semantically_identical_but_compare_unequal"), {});
+		Verification->SetArrayField(TEXT("duplicate_observations"), DuplicateConnectionEvidence);
+		Verification->SetArrayField(TEXT("automatically_generated_connections_still_present"), AutomaticConnectionEvidence);
 		Evidence->SetObjectField(TEXT("verification"), Verification);
 		const FString PostFingerprint = Sha256(FunctionName + TEXT("|") + Signature + TEXT("|")
 			+ NewGraph->GraphGuid.ToString(EGuidFormats::Digits) + TEXT("|")
-			+ FString::FromInt(WholeLogicalNodes.Num()) + TEXT("|") + FString::FromInt(CountFunctionLinks()));
+			+ FString::FromInt(WholeLogicalNodes.Num()) + TEXT("|") + FString::FromInt(ObservedWholeConnections.Num()));
 		Evidence->SetStringField(TEXT("post_semantic_fingerprint"), PostFingerprint);
 		if (!bVerified) return RollbackFunction(TEXT("VERIFY"), TEXT("EXACT_FUNCTION_SHELL_FAILED"), false);
 		if (FaultCheckpoint == TEXT("AFTER_VERIFY_BEFORE_SAVE"))
