@@ -32,16 +32,17 @@ describe("atomic bridge CONNECT_PINS cardinality", () => {
     expect(mutation).toContain("!bAlreadyConnected");
   });
 
-  it("delegates runtime type and conflict cardinality to Unreal without conversion or replacement", () => {
+  it("delegates runtime type and conflict cardinality to Unreal without conversion nodes", () => {
     const wholeMutation = section("TMap<FString, UEdGraphNode*> WholeLogicalNodes", "const int32 Middle = Operations->Num() / 2");
     const stageC = section('else if ((Version == TEXT("graph.connect-pins@1.0") || Version == TEXT("graph.disconnect-pins@1.0"))',
       "ConnectionDecision = ConnectionDecisionEvidence");
     for (const mutation of [wholeMutation, stageC]) {
-      expect(mutation).toContain("CONNECT_RESPONSE_MAKE");
       expect(mutation).toContain("TryCreateConnection(FromPin, ToPin)");
       expect(mutation).not.toContain("CreateAutomaticConversionNodeAndConnections");
       expect(mutation).not.toContain("CreatePromotedConnection");
     }
+    expect(wholeMutation).toContain("IsNativeDirectConnectionMakingResponse(Response.Response.GetValue())");
+    expect(stageC).toContain("CompatibilityResponse.Response == CONNECT_RESPONSE_MAKE");
     expect(stageC).toContain("!bConnected");
     expect(stageC).not.toContain("FromPin->LinkedTo.IsEmpty() && ToPin->LinkedTo.IsEmpty()");
   });

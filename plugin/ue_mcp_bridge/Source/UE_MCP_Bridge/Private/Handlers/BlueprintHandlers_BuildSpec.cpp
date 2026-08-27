@@ -831,6 +831,20 @@ namespace
 		}
 	}
 
+	bool IsNativeDirectConnectionMakingResponse(ECanCreateConnectionResponse Response)
+	{
+		switch (Response)
+		{
+		case CONNECT_RESPONSE_MAKE:
+		case CONNECT_RESPONSE_BREAK_OTHERS_A:
+		case CONNECT_RESPONSE_BREAK_OTHERS_B:
+		case CONNECT_RESPONSE_BREAK_OTHERS_AB:
+			return true;
+		default:
+			return false;
+		}
+	}
+
 	TSharedPtr<FJsonObject> StructuralPinTypeEvidence(const UEdGraphPin* Pin)
 	{
 		const FEdGraphPinType Empty;
@@ -2521,7 +2535,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ApplyAtomicBuildPlan(const TSharedPtr
 					&& FromPin->LinkedTo.Contains(ToPin) && ToPin->LinkedTo.Contains(FromPin);
 				bBodyMutated = FromPin && ToPin && FromNode != ToNode && FromCategory == ToCategory
 					&& !bAlreadyConnected
-					&& Response.Response == CONNECT_RESPONSE_MAKE
+					&& IsNativeDirectConnectionMakingResponse(Response.Response.GetValue())
 					&& CastChecked<UEdGraphSchema_K2>(NewGraph->GetSchema())->TryCreateConnection(FromPin, ToPin)
 					&& FromPin->LinkedTo.Contains(ToPin) && ToPin->LinkedTo.Contains(FromPin);
 				if (bBodyMutated) WholeConnections.Add(TPair<UEdGraphPin*, UEdGraphPin*>(FromPin, ToPin));
